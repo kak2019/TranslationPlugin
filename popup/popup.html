@@ -1,27 +1,27 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="popup.css">
-  <title>百炼页面翻译</title>
+  <title>Arya Translate</title>
 </head>
 <body>
   <div class="container">
     <header>
-      <h1>百炼翻译</h1>
-      <p id="modelSubtitle" class="subtitle">加载中…</p>
+      <h1>Arya Translate</h1>
+      <p id="modelSubtitle" class="subtitle">AI Web Translator</p>
     </header>
 
     <div id="status" class="status hidden"></div>
 
     <div class="field">
-      <label for="modelSelect">翻译模型</label>
+      <label for="modelSelect">Translation Model</label>
       <select id="modelSelect"></select>
     </div>
 
     <div class="field">
-      <label for="targetLang">目标语言</label>
+      <label for="targetLang">Target Language</label>
       <select id="targetLang">
         <option value="简体中文">简体中文</option>
         <option value="繁体中文">繁体中文</option>
@@ -35,24 +35,25 @@
     </div>
 
     <div class="actions">
-      <button id="translateBtn" class="btn primary">翻译当前页面</button>
-      <button id="cancelBtn" class="btn danger hidden">取消翻译</button>
-      <button id="restoreBtn" class="btn secondary">恢复原文</button>
+      <button id="translateBtn" class="btn primary">Translate This Page</button>
+      <button id="cancelBtn" class="btn danger hidden">Cancel</button>
+      <button id="restoreBtn" class="btn secondary">Restore Original</button>
     </div>
 
-    <p class="speed-tip">Qwen-MT 免费开箱即用 · 合并≤5800字 · 去重缓存 · 流式显示</p>
+    <p class="speed-tip">Free · AI-powered · No key needed for Qwen-MT</p>
 
     <div id="paymentBanner" class="payment-banner hidden">
       <span id="paymentBannerText"></span>
-      <button type="button" id="upgradeBtn" class="link-btn">订阅</button>
+      <button type="button" id="upgradeBtn" class="link-btn">Support</button>
     </div>
 
     <footer>
-      <a id="settingsLink" href="#">设置 API Key / 速度</a>
+      <a id="settingsLink" href="#">Settings & API Key</a>
     </footer>
   </div>
   <script src="../shared/models.js"></script>
   <script src="../shared/providers.js"></script>
+  <script src="../shared/afdian.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

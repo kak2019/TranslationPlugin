@@ -4,6 +4,23 @@
     'TEXTAREA', 'INPUT', 'SELECT', 'OPTION'
   ]);
 
+  const ARYA_PHRASES = [
+    'Arya is translating...',
+    'Let Arya be your eyes ✨',
+    'Breaking language barriers...',
+    'Reading the world for you...',
+    'Arya is working her magic ✨',
+    'Bridging languages, with love 💙',
+    "Almost there, hold tight...",
+    'Arya never gives up 💪',
+    'Every word, carefully handled...',
+    'Arya sees the world clearly 🌍',
+  ];
+
+  function getAryaPhrase() {
+    return ARYA_PHRASES[Math.floor(Math.random() * ARYA_PHRASES.length)];
+  }
+
   const translatedNodes = new WeakMap();
   let isTranslating = false;
   let cancelRequested = false;
@@ -40,23 +57,29 @@
       }
       .bailian-overlay-card {
         pointer-events: auto;
-        background: rgba(255,255,255,0.96); border-radius: 10px; padding: 10px 12px;
-        min-width: 180px; max-width: 240px;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.12); border: 1px solid rgba(0,0,0,0.06);
+        background: rgba(255,255,255,0.97); border-radius: 12px; padding: 10px 14px;
+        min-width: 200px; max-width: 260px;
+        box-shadow: 0 6px 24px rgba(99,102,241,0.15), 0 1px 4px rgba(0,0,0,0.08);
+        border: 1px solid rgba(99,102,241,0.15);
       }
       .bailian-overlay-header {
         display: flex; align-items: center; justify-content: space-between; gap: 8px;
         margin-bottom: 6px;
       }
-      .bailian-overlay-title { font-size: 12px; font-weight: 600; color: #1a1a2e; }
+      .bailian-overlay-title {
+        font-size: 13px; font-weight: 700; letter-spacing: 0.3px;
+        background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
       .bailian-overlay-close {
-        border: none; background: none; color: #999; font-size: 16px; line-height: 1;
-        cursor: pointer; padding: 0 2px;
+        border: none; background: none; color: #bbb; font-size: 16px; line-height: 1;
+        cursor: pointer; padding: 0 2px; transition: color 0.15s;
       }
       .bailian-overlay-close:hover { color: #dc2626; }
-      .bailian-overlay-message { font-size: 11px; color: #666; margin-bottom: 6px; line-height: 1.4; }
+      .bailian-overlay-message { font-size: 11px; color: #555; margin-bottom: 8px; line-height: 1.5; }
       .bailian-overlay-bar { height: 3px; background: #eee; border-radius: 2px; overflow: hidden; }
-      .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: 0%; transition: width 0.2s; }
+      .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: 0%; transition: width 0.3s; }
     `;
     document.head.appendChild(style);
   }
@@ -69,8 +92,8 @@
       overlayEl.innerHTML = `
         <div class="bailian-overlay-card">
           <div class="bailian-overlay-header">
-            <div class="bailian-overlay-title">百炼翻译</div>
-            <button class="bailian-overlay-close" type="button" title="取消翻译">×</button>
+            <div class="bailian-overlay-title">Arya Translate</div>
+            <button class="bailian-overlay-close" type="button" title="Cancel">×</button>
           </div>
           <div class="bailian-overlay-message"></div>
           <div class="bailian-overlay-bar"><div class="bailian-overlay-fill"></div></div>
@@ -91,10 +114,10 @@
 
   function showCancelledAndHide() {
     if (overlayEl) {
-      overlayEl.querySelector('.bailian-overlay-message').textContent = '已取消';
+      overlayEl.querySelector('.bailian-overlay-message').textContent = 'Arya stopped. See you next time 👋';
       overlayEl.querySelector('.bailian-overlay-fill').style.width = '0%';
     }
-    setTimeout(hideOverlay, 800);
+    setTimeout(hideOverlay, 1200);
   }
 
   const MT_BATCH_MAX_CHARS = 5800;
@@ -121,7 +144,7 @@
       nodes.push(walker.currentNode);
       scanned++;
       if (scanned % 400 === 0) {
-        onProgress(`扫描页面中… 已找到 ${scanned} 段`);
+        onProgress(`Arya is scanning... ${scanned} segments found`);
         await yieldToMain();
       }
     }
@@ -291,9 +314,11 @@
 
   function startBatchHeartbeat(batchIndex, totalBatches, onTick) {
     let elapsed = 0;
+    let phraseIndex = Math.floor(Math.random() * ARYA_PHRASES.length);
     return setInterval(() => {
       elapsed += 3;
-      onTick(batchIndex, totalBatches, elapsed);
+      phraseIndex = (phraseIndex + 1) % ARYA_PHRASES.length;
+      onTick(batchIndex, totalBatches, elapsed, ARYA_PHRASES[phraseIndex]);
     }, 3000);
   }
 
@@ -362,10 +387,10 @@
     async function processBatch(batch, batchIndex) {
       let heartbeatId = null;
       try {
-        heartbeatId = startBatchHeartbeat(batchIndex, batches.length, (idx, total, elapsed) => {
+        heartbeatId = startBatchHeartbeat(batchIndex, batches.length, (idx, total, elapsed, phrase) => {
           if (cancelRequested) return;
           showOverlay(
-            `第 ${idx}/${total} 批（${elapsed}s）`,
+            phrase || getAryaPhrase(),
             Math.round((completedNodes / Math.max(totalNodes, 1)) * 100)
           );
         });
@@ -480,7 +505,7 @@
       const dedupHint = uniqueTexts.length < totalNodes
         ? `（去重 ${totalNodes}→${uniqueTexts.length}）`
         : '';
-      showOverlay(`翻译中 0/${totalNodes}${dedupHint}`, 0);
+      showOverlay(getAryaPhrase(), 0);
 
       const { completed, failedBatches } = await runConcurrent(
         batches,
@@ -489,8 +514,8 @@
           if (cancelRequested) return;
           showOverlay(
             failCount
-              ? `翻译中 ${done}/${totalNodes}${dedupHint}（${failCount} 批重试）`
-              : `翻译中 ${done}/${totalNodes}${dedupHint}`,
+              ? `Retrying ${failCount} batch(es)... ${done}/${totalNodes}`
+              : getAryaPhrase(),
             Math.round((done / totalNodes) * 100)
           );
         },
@@ -503,7 +528,7 @@
 
       let finalFailed = failedBatches;
       if (failedBatches.length > 0) {
-        showOverlay(`重试中…`, Math.round((completed / totalNodes) * 100));
+        showOverlay(`Arya is trying again... 💪`, Math.round((completed / totalNodes) * 100));
         const retryResult = await retryFailedBatches(
           failedBatches,
           (recovered, total, idx, stillCount, nodeTotal) => {
@@ -523,7 +548,7 @@
       const successCount = totalNodes - failedNodeCount;
 
       if (finalFailed.length > 0) {
-        showOverlay(`完成 ${successCount}/${totalNodes}`, 100);
+        showOverlay(`Done! ${successCount}/${totalNodes} translated ✓`, 100);
         setTimeout(hideOverlay, 1500);
         return {
           success: true,
@@ -533,7 +558,7 @@
         };
       }
 
-      showOverlay('翻译完成', 100);
+      showOverlay("Done! Arya got your back ✓", 100);
       setTimeout(hideOverlay, 1000);
       return { success: true, count: totalNodes };
     } catch (error) {

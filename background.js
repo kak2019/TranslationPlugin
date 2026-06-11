@@ -701,14 +701,14 @@ function cancelSession(sessionId) {
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
-    id: 'bailian-translate-page',
-    title: '百炼翻译此页面',
+    id: 'arya-translate-page',
+    title: 'Arya: Translate this page',
     contexts: ['page']
   });
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'bailian-translate-page' || !tab?.id) return;
+  if (info.menuItemId !== 'arya-translate-page' || !tab?.id) return;
   try {
     await chrome.tabs.sendMessage(tab.id, { action: 'translate' });
   } catch {

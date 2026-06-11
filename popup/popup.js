@@ -39,7 +39,8 @@ async function sendToContentScript(tabId, action, extra = {}) {
 
 function updateModelHint(modelId) {
   const provider = getModelProvider(modelId);
-  const providerName = PROVIDERS[provider]?.name || '百炼';
+  const providerMap = { bailian: 'Qwen / Bailian', deepseek: 'DeepSeek', xiaomi: 'MiMo' };
+  const providerName = providerMap[provider] || PROVIDERS[provider]?.name || 'Bailian';
   modelSubtitle.textContent = `${getModelName(modelId)} · ${providerName}`;
 }
 
@@ -51,9 +52,9 @@ function updateAccessHint(config, modelId) {
 
   if (config.usingHostedKey && isBailianMt) {
     paymentBanner.classList.remove('hidden');
-    paymentBannerText.textContent = 'Qwen-MT 免费使用中，欢迎爱发电打赏';
-    upgradeBtn.textContent = '爱发电';
-    modelSubtitle.textContent = `${config.modelName || ''} · 托管服务`;
+    paymentBannerText.textContent = 'Arya is free! Support the author 💙';
+    upgradeBtn.textContent = 'Donate';
+    modelSubtitle.textContent = `${config.modelName || ''} · Free`;
     return;
   }
 
@@ -77,7 +78,7 @@ async function init() {
       const isBailianMt = provider === 'bailian' && stored.model?.trim().toLowerCase().startsWith('qwen-mt');
       if (!isBailianMt) {
         const name = PROVIDERS[provider]?.name || '对应厂商';
-        showStatus(`请先在设置中配置${name} API Key`, 'error');
+        showStatus(`Please set up your ${name} API Key in Settings`, 'error');
       }
     }
     updateAccessHint(config, stored.model);
@@ -89,7 +90,7 @@ async function init() {
       const state = await sendToContentScript(tab.id, 'getTranslating');
       if (state?.isTranslating) {
         setTranslating(true);
-        showStatus('页面正在翻译中…', 'info');
+        showStatus('Arya is translating...', 'info');
       }
     } catch {
       // ignore
@@ -108,14 +109,14 @@ targetLangSelect.addEventListener('change', () => {
 
 translateBtn.addEventListener('click', async () => {
   setTranslating(true);
-  showStatus('正在翻译，请稍候…', 'info');
+  showStatus('Let Arya be your eyes... ✨', 'info');
 
   try {
     const tab = await getActiveTab();
-    if (!tab?.id) throw new Error('无法获取当前标签页');
+    if (!tab?.id) throw new Error('Cannot access current tab');
 
     if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) {
-      throw new Error('无法翻译浏览器内置页面');
+      throw new Error('Cannot translate built-in browser pages');
     }
 
     await chrome.storage.sync.set({
@@ -126,15 +127,15 @@ translateBtn.addEventListener('click', async () => {
     const result = await sendToContentScript(tab.id, 'translate');
 
     if (result?.cancelled) {
-      showStatus('翻译已取消', 'info');
+      showStatus('Arya stopped. See you next time 👋', 'info');
     } else if (result?.success) {
       if (result.warning) {
         showStatus(result.warning, 'info');
       } else {
-        showStatus(`翻译完成，共 ${result.count} 段文本`, 'success');
+        showStatus(`Done! Arya translated ${result.count} segments ✓`, 'success');
       }
     } else {
-      showStatus(result?.error || '翻译失败', 'error');
+      showStatus(result?.error || 'Translation failed', 'error');
     }
   } catch (error) {
     showStatus(error.message, 'error');
@@ -148,7 +149,7 @@ cancelBtn.addEventListener('click', async () => {
     const tab = await getActiveTab();
     if (!tab?.id) return;
     await sendToContentScript(tab.id, 'cancel');
-    showStatus('翻译已取消', 'info');
+    showStatus('Arya stopped. See you next time 👋', 'info');
     setTranslating(false);
   } catch (error) {
     showStatus(error.message, 'error');
@@ -160,7 +161,7 @@ restoreBtn.addEventListener('click', async () => {
     const tab = await getActiveTab();
     if (!tab?.id) return;
     await sendToContentScript(tab.id, 'restore');
-    showStatus('已恢复原文', 'success');
+    showStatus('Original text restored ✓', 'success');
   } catch (error) {
     showStatus(error.message, 'error');
   }
@@ -172,7 +173,7 @@ settingsLink.addEventListener('click', (e) => {
 });
 
 upgradeBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'openAfdianPage' });
+  chrome.runtime.sendMessage({ action: 'openAfdianPage' }); // open donation page
 });
 
 init();

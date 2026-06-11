@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>百炼翻译 - 设置</title>
+  <title>Arya Translate — Settings</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -67,6 +67,14 @@
       background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
       padding: 10px 12px; margin-top: 8px; line-height: 1.5;
     }
+    .arya-easter-egg {
+      font-size: 11px; color: #d1d5db; text-align: center;
+      margin-top: 28px; line-height: 1.8; user-select: none;
+    }
+    .arya-version-note {
+      font-size: 10px; color: #e5e7eb; text-align: center;
+      margin-top: 4px; margin-bottom: 20px; font-style: italic;
+    }
     .plan-box {
       background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 8px;
       padding: 14px 16px; margin-bottom: 16px; line-height: 1.6;
@@ -83,23 +91,24 @@
 </head>
 <body>
   <div class="wrap">
-    <h1>翻译插件设置</h1>
-    <p class="desc">不同厂商使用各自的官方 API。Qwen-MT 专用翻译模型走百炼；DeepSeek、小米 MiMo 走各自官方平台。</p>
+    <h1>Arya Translate</h1>
+    <p class="desc" style="font-size:13px;color:#888;margin-bottom:4px">AI Web Translator · Powered by Qwen-MT</p>
+    <p class="desc">Different providers use their own API keys. Qwen-MT uses Bailian; DeepSeek and MiMo use their own platforms.</p>
 
     <div class="info">
       Qwen-MT 开箱即用，无需填写 Key。如需使用通义千问 / DeepSeek / MiMo 等模型，请在下方填写对应 API Key。
     </div>
 
     <div class="card">
-      <h2>赞助作者（爱发电，可选）</h2>
+      <h2>Support the Author (Optional)</h2>
       <div class="plan-box">
-        <div class="plan-status">Qwen-MT 免费使用</div>
-        <p class="hint">如果这个插件帮到了你，欢迎在爱发电随意打赏，任意金额均可，完全自愿，不影响任何功能。</p>
+        <div class="plan-status">Arya Translate is free ✨</div>
+        <p class="hint">If Arya helped you, feel free to buy me a coffee — any amount is appreciated. Completely optional, never affects functionality.</p>
         <div class="plan-actions">
-          <button type="button" id="afdianBtn">打开爱发电主页</button>
+          <button type="button" id="afdianBtn">Open Afdian Donation Page</button>
         </div>
         <p class="hint" style="margin-top:10px">
-          <a id="afdianLink" href="#" target="_blank" rel="noopener">afdian.com 赞助页</a>
+          <a id="afdianLink" href="#" target="_blank" rel="noopener">ifdian.net/a/flynt</a>
         </p>
       </div>
     </div>
@@ -183,10 +192,10 @@
     </div>
 
     <div class="card support-card">
-      <h2>☕ 请作者喝一杯咖啡</h2>
+      <h2>☕ Buy Me a Coffee (WeChat)</h2>
       <p class="support-desc">
-        如果这个插件帮到了你，欢迎扫码赞赏，<strong>任意金额</strong>都是对我的鼓励。<br>
-        您的支持是我持续维护、优化的动力，感谢！
+        Scan the QR code to tip — <strong>any amount</strong> means a lot to me.<br>
+        Your support keeps Arya alive and improving. Thank you! 💙
       </p>
       <div class="support-qr-wrap">
         <img id="donateQr" class="support-qr" alt="微信赞赏二维码" width="180" height="180">
@@ -194,6 +203,12 @@
       <p class="support-note">微信扫码即可 · 自愿支持，不影响任何功能</p>
       <p id="donateQrError" class="support-error"></p>
     </div>
+
+    <p class="arya-easter-egg">
+      Arya is proudly named after my girlfriend. ❤️<br>
+      Hope it helps you read the world better.
+    </p>
+    <p class="arya-version-note">v1.0.0 — Hello World, and Hello Arya. 💕</p>
   </div>
   <script src="../shared/models.js"></script>
   <script src="../shared/afdian.js"></script>
