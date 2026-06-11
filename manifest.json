@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "百炼页面翻译",
+  "version": "1.6.0",
+  "description": "使用阿里云百炼 Qwen-MT 模型免费翻译网页，支持自带 API Key",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://ifdian.net/*",
+    "https://dashscope.aliyuncs.com/*",
+    "https://dashscope-intl.aliyuncs.com/*",
+    "https://cn-hongkong.dashscope.aliyuncs.com/*",
+    "https://api.deepseek.com/*",
+    "https://api.xiaomimimo.com/*",
+    "https://flyntpan.oss-cn-beijing.aliyuncs.com/*",
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_page": "options/options.html",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
