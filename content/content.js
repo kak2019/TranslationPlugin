@@ -22,16 +22,60 @@
   }
 
   const translatedNodes = new WeakMap();
+  const MUTATION_DEBOUNCE_MS = 350;
+  const SKIP_ANCESTOR_CLASSES = new Set(['sr-only', 'visually-hidden', 'notranslate']);
+
   let isTranslating = false;
+  let isProcessingIncremental = false;
+  let isApplyingTranslation = false;
   let cancelRequested = false;
+  let watchModeActive = false;
   let sessionId = null;
   let batchCounter = 0;
   let overlayEl = null;
+  let domObserver = null;
+  let mutationDebounceTimer = null;
+  let activeSettings = null;
+  const pendingIncrementalNodes = new Set();
 
-  function isVisible(element) {
-    if (!element || element.nodeType !== Node.ELEMENT_NODE) return true;
-    const style = window.getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  function isOurOverlayElement(el) {
+    return el?.id === 'bailian-translate-overlay' || el?.id === 'bailian-translate-styles'
+      || Boolean(el?.closest?.('#bailian-translate-overlay'));
+  }
+
+  function shouldSkipElement(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    if (isOurOverlayElement(el)) return true;
+    if (el.getAttribute('translate') === 'no') return true;
+    for (const cls of el.classList || []) {
+      if (SKIP_ANCESTOR_CLASSES.has(cls)) return true;
+    }
+    return false;
+  }
+
+  function isValidTranslation(text) {
+    return text != null && String(text).trim().length > 0;
+  }
+
+  function collectTextNodesFromRootTree(root, nodes) {
+    if (!root) return;
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const text = node.textContent.trim();
+        if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
+        if (shouldSkipNode(node)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+
+    const elWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    while (elWalker.nextNode()) {
+      const el = elWalker.currentNode;
+      if (el.shadowRoot) collectTextNodesFromRootTree(el.shadowRoot, nodes);
+    }
   }
 
   function shouldSkipNode(node) {
@@ -39,7 +83,7 @@
     let parent = node.parentElement;
     while (parent) {
       if (SKIP_TAGS.has(parent.tagName)) return true;
-      if (!isVisible(parent)) return true;
+      if (shouldSkipElement(parent)) return true;
       parent = parent.parentElement;
     }
     return false;
@@ -129,26 +173,37 @@
   }
 
   async function collectTextNodesAsync(onProgress) {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        const text = node.textContent.trim();
-        if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
-        if (shouldSkipNode(node)) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
-      }
-    });
-
     const nodes = [];
     let scanned = 0;
-    while (walker.nextNode()) {
-      nodes.push(walker.currentNode);
-      scanned++;
-      if (scanned % 400 === 0) {
+
+    if (document.body) {
+      collectTextNodesFromRootTree(document.body, nodes);
+      scanned = nodes.length;
+      if (scanned >= 400) {
         onProgress(`Arya is scanning... ${scanned} segments found`);
         await yieldToMain();
       }
     }
+
     return nodes;
+  }
+
+  async function collectMissedTextNodes() {
+    const all = await collectTextNodesAsync(() => {});
+    return all.filter((node) => !translatedNodes.has(node));
+  }
+
+  async function sweepMissedNodes(settings) {
+    let total = 0;
+    for (let round = 0; round < 2; round++) {
+      const missed = await collectMissedTextNodes();
+      if (!missed.length || cancelRequested) break;
+      showOverlay(`Arya is catching up... ${missed.length} missed`, 85);
+      const result = await translateNodeList(missed, settings, { incremental: true });
+      total += result.count;
+      if (!result.count) break;
+    }
+    return total;
   }
 
   function getSettings() {
@@ -326,27 +381,235 @@
     if (!translatedNodes.has(node)) {
       translatedNodes.set(node, node.textContent);
     }
-    node.textContent = translated;
+    isApplyingTranslation = true;
+    try {
+      node.textContent = translated;
+    } finally {
+      isApplyingTranslation = false;
+    }
+  }
+
+  function stopWatchMode() {
+    watchModeActive = false;
+    activeSettings = null;
+    pendingIncrementalNodes.clear();
+    if (mutationDebounceTimer) {
+      clearTimeout(mutationDebounceTimer);
+      mutationDebounceTimer = null;
+    }
+    if (domObserver) {
+      domObserver._spaCleanup?.();
+      domObserver.disconnect();
+      domObserver = null;
+    }
   }
 
   function restoreOriginal() {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const original = translatedNodes.get(node);
-      if (original !== undefined) {
-        node.textContent = original;
-        translatedNodes.delete(node);
+    stopWatchMode();
+    sessionId = null;
+    isApplyingTranslation = true;
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        const original = translatedNodes.get(node);
+        if (original !== undefined) {
+          node.textContent = original;
+          translatedNodes.delete(node);
+        }
       }
+    } finally {
+      isApplyingTranslation = false;
     }
   }
 
   function cancelTranslation() {
     cancelRequested = true;
-    if (sessionId) {
-      chrome.runtime.sendMessage({ action: 'cancelSession', sessionId });
+    const sid = sessionId;
+    stopWatchMode();
+    if (sid) {
+      chrome.runtime.sendMessage({ action: 'cancelSession', sessionId: sid });
     }
+    sessionId = null;
     showCancelledAndHide();
+  }
+
+  function collectTextNodesFromRoot(root) {
+    const nodes = [];
+    if (!root) return nodes;
+
+    if (root.nodeType === Node.TEXT_NODE) {
+      const text = root.textContent.trim();
+      if (text.length >= 2 && !shouldSkipNode(root)) nodes.push(root);
+      return nodes;
+    }
+
+    if (root.nodeType !== Node.ELEMENT_NODE || isOurOverlayElement(root)) return nodes;
+
+    collectTextNodesFromRootTree(root, nodes);
+    return nodes;
+  }
+
+  function extractTextNodesFromMutations(records) {
+    const nodes = new Set();
+    for (const record of records) {
+      if (record.type === 'characterData' && record.target?.nodeType === Node.TEXT_NODE) {
+        collectTextNodesFromRoot(record.target).forEach((n) => nodes.add(n));
+      }
+      for (const node of record.addedNodes || []) {
+        collectTextNodesFromRoot(node).forEach((n) => nodes.add(n));
+      }
+    }
+    return [...nodes];
+  }
+
+  function scheduleIncrementalFlush() {
+    if (!watchModeActive || mutationDebounceTimer) return;
+    mutationDebounceTimer = setTimeout(() => {
+      mutationDebounceTimer = null;
+      flushIncrementalQueue();
+    }, MUTATION_DEBOUNCE_MS);
+  }
+
+  function queueIncrementalNodes(nodes) {
+    if (!watchModeActive || !nodes.length) return;
+    for (const node of nodes) pendingIncrementalNodes.add(node);
+    scheduleIncrementalFlush();
+  }
+
+  async function translateNodeList(textNodes, settings, { incremental = false } = {}) {
+    if (!textNodes.length || cancelRequested) return { count: 0, failed: 0 };
+
+    const { uniqueTexts, textToNodes, totalNodes } = buildUniqueTextPlan(textNodes);
+    if (!uniqueTexts.length) return { count: 0, failed: 0 };
+
+    const ctx = { textToNodes, uniqueTexts, totalNodes, isMt: settings.isMt };
+    const batches = settings.isMt
+      ? chunkUniqueTexts(uniqueTexts)
+      : chunkUniqueByCount(uniqueTexts, settings.batchSize);
+
+    if (incremental) {
+      showOverlay(`Arya found ${totalNodes} new segment(s)...`, 30);
+    }
+
+    const { completed, failedBatches } = await runConcurrent(
+      batches,
+      settings.concurrency,
+      (done, totalBatches, batchIndex, failCount = 0) => {
+        if (cancelRequested) return;
+        if (incremental) {
+          showOverlay(
+            `Translating new content... ${done}/${totalNodes}`,
+            Math.min(95, Math.round((done / totalNodes) * 100))
+          );
+        } else {
+          showOverlay(
+            failCount
+              ? `Retrying ${failCount} batch(es)... ${done}/${totalNodes}`
+              : getAryaPhrase(),
+            Math.round((done / totalNodes) * 100)
+          );
+        }
+      },
+      ctx
+    );
+
+    if (cancelRequested) return { count: completed, failed: 0, cancelled: true };
+
+    let finalFailed = failedBatches;
+    if (failedBatches.length > 0 && !incremental) {
+      showOverlay('Arya is trying again... 💪', Math.round((completed / totalNodes) * 100));
+    }
+    if (failedBatches.length > 0) {
+      const retryResult = await retryFailedBatches(
+        failedBatches,
+        incremental
+          ? () => {}
+          : (recovered, total, idx, stillCount, nodeTotal) => {
+              showOverlay(
+                `重试 ${idx}/${total}（${completed + recovered}/${nodeTotal}）`,
+                Math.round(((completed + recovered) / totalNodes) * 100)
+              );
+            },
+        ctx
+      );
+      finalFailed = retryResult.stillFailed;
+    }
+
+    const failedNodeCount = finalFailed.reduce((n, b) => {
+      return n + b.globalIndices.reduce(
+        (sum, idx) => sum + (textToNodes.get(uniqueTexts[idx])?.length || 0),
+        0
+      );
+    }, 0);
+
+    return { count: totalNodes - failedNodeCount, failed: failedNodeCount };
+  }
+
+  async function flushIncrementalQueue() {
+    if (!watchModeActive || isProcessingIncremental || isTranslating || cancelRequested) return;
+    if (!pendingIncrementalNodes.size || !activeSettings) return;
+
+    const nodes = [...pendingIncrementalNodes];
+    pendingIncrementalNodes.clear();
+    isProcessingIncremental = true;
+
+    try {
+      const result = await translateNodeList(nodes, activeSettings, { incremental: true });
+      if (result.count > 0 && watchModeActive) {
+        showOverlay(`+${result.count} new segment(s) translated ✓`, 100);
+        setTimeout(() => {
+          if (watchModeActive) hideOverlay();
+        }, 1200);
+      } else if (watchModeActive) {
+        hideOverlay();
+      }
+    } catch {
+      if (watchModeActive) hideOverlay();
+    } finally {
+      isProcessingIncremental = false;
+      if (pendingIncrementalNodes.size > 0) scheduleIncrementalFlush();
+    }
+  }
+
+  function onDomMutation(records) {
+    if (!watchModeActive || isApplyingTranslation || cancelRequested) return;
+    const nodes = extractTextNodesFromMutations(records);
+    if (nodes.length) queueIncrementalNodes(nodes);
+  }
+
+  function startWatchMode(settings) {
+    stopWatchMode();
+    watchModeActive = true;
+    activeSettings = settings;
+    if (!sessionId) sessionId = String(Date.now());
+
+    domObserver = new MutationObserver(onDomMutation);
+    domObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+
+    const onSpaNav = () => {
+      if (!watchModeActive) return;
+      collectTextNodesAsync(() => {}).then((nodes) => {
+        if (nodes.length) queueIncrementalNodes(nodes);
+      });
+    };
+
+    window.addEventListener('popstate', onSpaNav);
+    window.addEventListener('hashchange', onSpaNav);
+
+    domObserver._spaCleanup = () => {
+      window.removeEventListener('popstate', onSpaNav);
+      window.removeEventListener('hashchange', onSpaNav);
+    };
+
+    collectTextNodesAsync(() => {}).then((nodes) => {
+      const missed = nodes.filter((n) => !translatedNodes.has(n));
+      if (missed.length) queueIncrementalNodes(missed);
+    });
   }
 
   async function runConcurrent(batches, concurrency, onProgress, ctx) {
@@ -356,6 +619,7 @@
     const appliedUnique = new Set();
 
     function markApplied(uniqueIdx, translated) {
+      if (!isValidTranslation(translated)) return 0;
       if (appliedUnique.has(uniqueIdx)) return 0;
       appliedUnique.add(uniqueIdx);
       const nodes = textToNodes.get(uniqueTexts[uniqueIdx]);
@@ -446,6 +710,7 @@
     const appliedUnique = new Set();
 
     function markApplied(uniqueIdx, translated) {
+      if (!isValidTranslation(translated)) return 0;
       if (appliedUnique.has(uniqueIdx)) return 0;
       appliedUnique.add(uniqueIdx);
       const nodes = textToNodes.get(uniqueTexts[uniqueIdx]);
@@ -482,6 +747,7 @@
   async function translatePage() {
     if (isTranslating) return { success: false, error: '正在翻译中，请稍候' };
 
+    stopWatchMode();
     isTranslating = true;
     cancelRequested = false;
     sessionId = String(Date.now());
@@ -489,85 +755,56 @@
 
     try {
       const settings = await getSettings();
-      const textNodes = await collectTextNodesAsync(() => {});
+      const textNodes = await collectTextNodesAsync((msg) => {
+        showOverlay(msg, 0);
+      });
       if (textNodes.length === 0) {
         return { success: false, error: '未找到可翻译的文本' };
       }
 
-      const { uniqueTexts, textToNodes, totalNodes } = buildUniqueTextPlan(textNodes);
-      const ctx = { textToNodes, uniqueTexts, totalNodes, isMt: settings.isMt };
-
-      const batches = settings.isMt
-        ? chunkUniqueTexts(uniqueTexts)
-        : chunkUniqueByCount(uniqueTexts, settings.batchSize);
-      const concurrency = settings.concurrency;
-
-      const dedupHint = uniqueTexts.length < totalNodes
-        ? `（去重 ${totalNodes}→${uniqueTexts.length}）`
-        : '';
       showOverlay(getAryaPhrase(), 0);
 
-      const { completed, failedBatches } = await runConcurrent(
-        batches,
-        concurrency,
-        (done, totalBatches, batchIndex, failCount = 0) => {
-          if (cancelRequested) return;
-          showOverlay(
-            failCount
-              ? `Retrying ${failCount} batch(es)... ${done}/${totalNodes}`
-              : getAryaPhrase(),
-            Math.round((done / totalNodes) * 100)
-          );
-        },
-        ctx
-      );
+      const result = await translateNodeList(textNodes, settings, { incremental: false });
 
       if (cancelRequested) {
+        sessionId = null;
         return { success: false, cancelled: true, error: '翻译已取消' };
       }
 
-      let finalFailed = failedBatches;
-      if (failedBatches.length > 0) {
-        showOverlay(`Arya is trying again... 💪`, Math.round((completed / totalNodes) * 100));
-        const retryResult = await retryFailedBatches(
-          failedBatches,
-          (recovered, total, idx, stillCount, nodeTotal) => {
-            showOverlay(
-              `重试 ${idx}/${total}（${completed + recovered}/${nodeTotal}）`,
-              Math.round(((completed + recovered) / totalNodes) * 100)
-            );
-          },
-          ctx
-        );
-        finalFailed = retryResult.stillFailed;
-      }
+      await sweepMissedNodes(settings);
 
-      const failedNodeCount = finalFailed.reduce((n, b) => {
-        return n + b.globalIndices.reduce((sum, idx) => sum + (textToNodes.get(uniqueTexts[idx])?.length || 0), 0);
-      }, 0);
-      const successCount = totalNodes - failedNodeCount;
+      const missedAfterSweep = await collectMissedTextNodes();
+      const { count: successCount, failed: failedNodeCount } = result;
+      const stillMissed = missedAfterSweep.length;
 
-      if (finalFailed.length > 0) {
-        showOverlay(`Done! ${successCount}/${totalNodes} translated ✓`, 100);
+      if (failedNodeCount > 0 || stillMissed > 0) {
+        const totalAttempted = successCount + failedNodeCount + stillMissed;
+        showOverlay(`Done! ${successCount}/${totalAttempted} translated ✓`, 100);
         setTimeout(hideOverlay, 1500);
+        startWatchMode(settings);
+        const parts = [];
+        if (failedNodeCount > 0) parts.push(`${failedNodeCount} 段 API 限流`);
+        if (stillMissed > 0) parts.push(`${stillMissed} 段将自动补译`);
         return {
           success: true,
           count: successCount,
-          failed: failedNodeCount,
-          warning: `${failedNodeCount} 段因 API 限流未能翻译，请稍后重试`
+          failed: failedNodeCount + stillMissed,
+          warning: parts.length ? `${parts.join('，')}，稍后自动重试` : undefined
         };
       }
 
-      showOverlay("Done! Arya got your back ✓", 100);
+      showOverlay('Done! Arya got your back ✓', 100);
       setTimeout(hideOverlay, 1000);
-      return { success: true, count: totalNodes };
+      startWatchMode(settings);
+      return { success: true, count: successCount };
     } catch (error) {
+      stopWatchMode();
+      sessionId = null;
       if (!cancelRequested) hideOverlay();
       return { success: false, error: error.message };
     } finally {
       isTranslating = false;
       cancelRequested = false;
-      sessionId = null;
     }
   }
 
@@ -587,7 +824,11 @@
       return true;
     }
     if (message.action === 'getTranslating') {
-      sendResponse({ isTranslating });
+      sendResponse({ isTranslating: isTranslating || isProcessingIncremental });
+      return true;
+    }
+    if (message.action === 'getWatchMode') {
+      sendResponse({ watchModeActive });
       return true;
     }
     return false;

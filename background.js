@@ -216,7 +216,7 @@ function splitMtTranslation(translated, expectedCount) {
   for (let i = 0; i < expectedCount; i++) {
     const re = new RegExp(`<<${i}>>([\\s\\S]*?)(?=<<\\d+>>|$)`);
     const m = translated.match(re);
-    if (m) {
+    if (m && m[1].trim()) {
       parts[i] = m[1].trim();
       matched++;
     }
@@ -226,7 +226,19 @@ function splitMtTranslation(translated, expectedCount) {
   const byNewline = translated.split('\n').map((s) => s.trim()).filter(Boolean);
   if (byNewline.length === expectedCount) return byNewline;
 
+  if (matched > 0) return parts;
+
   return null;
+}
+
+async function fillMissingMtParts(parts, texts, config, api, requestId, depth) {
+  const filled = [...parts];
+  for (let i = 0; i < filled.length; i++) {
+    if (filled[i]?.trim()) continue;
+    const [one] = await callMtTranslateBatch([texts[i]], config, api, `${requestId}-f${i}`, depth + 1, null);
+    filled[i] = one;
+  }
+  return filled;
 }
 
 async function callMtTranslateBatch(texts, config, api, requestId, depth = 0, streamCallback = null) {
@@ -244,7 +256,11 @@ async function callMtTranslateBatch(texts, config, api, requestId, depth = 0, st
   const translated = await callMtTranslateAPI(joined, config, api, requestId, wrapStream, texts.length);
   const parts = splitMtTranslation(translated, texts.length);
 
-  if (parts) return parts;
+  if (parts) {
+    const hasMissing = parts.some((p) => !p?.trim());
+    if (!hasMissing) return parts;
+    return fillMissingMtParts(parts, texts, config, api, requestId, depth);
+  }
 
   if (texts.length <= 3 || depth >= 1) {
     const results = [];
@@ -483,12 +499,13 @@ async function callMtTranslateAPI(text, config, api, requestId, streamCallback =
               if (segmentCount > 1) {
                 const finalParts = splitMtTranslation(content, segmentCount);
                 if (finalParts) {
-                  finalParts.forEach((t, i) => {
-                    if (!appliedSegments.has(i)) {
+                  for (let i = 0; i < finalParts.length; i++) {
+                    const t = finalParts[i];
+                    if (t?.trim() && !appliedSegments.has(i)) {
                       streamCallback([{ index: i, text: t }]);
                       appliedSegments.add(i);
                     }
-                  });
+                  }
                 }
               }
               return content;
