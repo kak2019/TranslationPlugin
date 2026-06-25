@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Arya Translate - AI Web Translator",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Free AI web translator powered by Qwen-MT. Bridging languages, inspired by love.",
   "permissions": [
     "storage",
