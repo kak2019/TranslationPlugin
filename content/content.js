@@ -24,6 +24,7 @@
   const translatedNodes = new WeakMap();
   const MUTATION_DEBOUNCE_MS = 350;
   const SKIP_ANCESTOR_CLASSES = new Set(['sr-only', 'visually-hidden', 'notranslate']);
+  const isTopFrame = window === window.top;
 
   let isTranslating = false;
   let isProcessingIncremental = false;
@@ -33,14 +34,97 @@
   let sessionId = null;
   let batchCounter = 0;
   let overlayEl = null;
+  let selectionBubbleEl = null;
+  let selectionBubbleOutsideHandler = null;
+  let currentLangHint = '';
   let domObserver = null;
   let mutationDebounceTimer = null;
   let activeSettings = null;
   const pendingIncrementalNodes = new Set();
 
+  function escapeHtml(text) {
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function scriptCounts(text) {
+    const cjk = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+    const kana = (text.match(/[\u3040-\u30ff]/g) || []).length;
+    const hangul = (text.match(/[\uac00-\ud7af]/g) || []).length;
+    const latin = (text.match(/[a-zA-ZÀ-ÿ]/g) || []).length;
+    const cyrillic = (text.match(/[\u0400-\u04ff]/g) || []).length;
+    return { cjk, kana, hangul, latin, cyrillic, total: text.length };
+  }
+
+  function isLikelyNonTranslatable(text) {
+    const t = text.trim();
+    if (t.length < 2) return true;
+    if (/^https?:\/\/\S+$/i.test(t)) return true;
+    if (/^[\d\s.,:+\-/()%#]+$/.test(t)) return true;
+    if (/^[\d.,]+\s*(KB|MB|GB|px|em|rem|ms|s|min|hr|%)$/i.test(t)) return true;
+    return false;
+  }
+
+  function likelyAlreadyTargetLanguage(text, targetLang) {
+    if (!text || !targetLang) return false;
+    if (isLikelyNonTranslatable(text)) return true;
+
+    const { cjk, kana, hangul, latin, cyrillic, total } = scriptCounts(text);
+    if (total === 0) return true;
+
+    const lang = targetLang.toLowerCase();
+    if (lang.includes('中文') || lang.includes('chinese')) {
+      return cjk / total > 0.55 && latin / total < 0.2;
+    }
+    if (lang === 'english') {
+      return latin / total > 0.65 && cjk === 0 && kana === 0 && hangul === 0;
+    }
+    if (lang.includes('日本')) {
+      return (kana + cjk) / total > 0.4 && kana > 0;
+    }
+    if (lang.includes('한국') || lang.includes('korean')) {
+      return hangul / total > 0.4;
+    }
+    if (lang.includes('français') || lang.includes('francais') || lang.includes('deutsch')
+      || lang.includes('español') || lang.includes('espanol')) {
+      return latin / total > 0.7 && cjk === 0 && kana === 0;
+    }
+    if (lang.includes('рус') || lang.includes('russian')) {
+      return cyrillic / total > 0.45;
+    }
+    return false;
+  }
+
+  function detectPageLanguage(textNodes) {
+    let combined = '';
+    for (const node of textNodes) {
+      const t = node.textContent.trim();
+      if (t.length < 4 || isLikelyNonTranslatable(t)) continue;
+      combined += `${t} `;
+      if (combined.length > 2500) break;
+    }
+    if (!combined.trim()) return 'Unknown';
+
+    const { cjk, kana, hangul, latin, cyrillic, total } = scriptCounts(combined);
+    if (total === 0) return 'Unknown';
+    if (kana / total > 0.06 && kana >= cjk * 0.05) return '日本語';
+    if (hangul / total > 0.2) return '한국어';
+    if (cyrillic / total > 0.2) return 'Русский';
+    if (cjk / total > 0.22) return '中文';
+    if (latin / total > 0.35) return 'English';
+    return 'Mixed';
+  }
+
+  function buildLangHint(sourceLang, targetLang) {
+    return `Detected: ${sourceLang} → ${targetLang}`;
+  }
+
   function isOurOverlayElement(el) {
     return el?.id === 'bailian-translate-overlay' || el?.id === 'bailian-translate-styles'
-      || Boolean(el?.closest?.('#bailian-translate-overlay'));
+      || el?.id === 'bailian-selection-bubble'
+      || Boolean(el?.closest?.('#bailian-translate-overlay, #bailian-selection-bubble'));
   }
 
   function shouldSkipElement(el) {
@@ -57,7 +141,7 @@
     return text != null && String(text).trim().length > 0;
   }
 
-  function collectTextNodesFromRootTree(root, nodes) {
+  function collectTextNodesFromRootTree(root, nodes, targetLang) {
     if (!root) return;
 
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -65,6 +149,9 @@
         const text = node.textContent.trim();
         if (!text || text.length < 2) return NodeFilter.FILTER_REJECT;
         if (shouldSkipNode(node)) return NodeFilter.FILTER_REJECT;
+        if (targetLang && likelyAlreadyTargetLanguage(text, targetLang)) {
+          return NodeFilter.FILTER_REJECT;
+        }
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -74,7 +161,7 @@
     const elWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
     while (elWalker.nextNode()) {
       const el = elWalker.currentNode;
-      if (el.shadowRoot) collectTextNodesFromRootTree(el.shadowRoot, nodes);
+      if (el.shadowRoot) collectTextNodesFromRootTree(el.shadowRoot, nodes, targetLang);
     }
   }
 
@@ -122,13 +209,36 @@
       }
       .bailian-overlay-close:hover { color: #dc2626; }
       .bailian-overlay-message { font-size: 11px; color: #555; margin-bottom: 8px; line-height: 1.5; }
+      .bailian-overlay-lang {
+        font-size: 10px; color: #6366f1; font-weight: 600; margin-bottom: 4px;
+      }
+      .bailian-overlay-status { font-size: 11px; color: #555; line-height: 1.5; }
       .bailian-overlay-bar { height: 3px; background: #eee; border-radius: 2px; overflow: hidden; }
       .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: 0%; transition: width 0.3s; }
+      #bailian-selection-bubble {
+        position: fixed; z-index: 2147483646; max-width: 320px; min-width: 120px;
+        background: rgba(255,255,255,0.98); border: 1px solid rgba(99,102,241,0.25);
+        border-radius: 10px; padding: 10px 12px;
+        box-shadow: 0 8px 28px rgba(99,102,241,0.18), 0 2px 8px rgba(0,0,0,0.08);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        pointer-events: auto;
+      }
+      .bailian-selection-label {
+        font-size: 10px; font-weight: 700; color: #6366f1; margin-bottom: 6px;
+      }
+      .bailian-selection-text {
+        font-size: 13px; color: #1a1a2e; line-height: 1.55; word-break: break-word;
+      }
+      .bailian-selection-original {
+        font-size: 11px; color: #888; margin-top: 8px; line-height: 1.4;
+        border-top: 1px solid #eee; padding-top: 6px; word-break: break-word;
+      }
     `;
     document.head.appendChild(style);
   }
 
-  function showOverlay(message, progress) {
+  function showOverlay(message, progress, langHint) {
+    if (!isTopFrame) return;
     ensureOverlayStyles();
     if (!overlayEl) {
       overlayEl = document.createElement('div');
@@ -147,18 +257,78 @@
       overlayEl.querySelector('.bailian-overlay-close').addEventListener('click', cancelTranslation);
     }
 
-    overlayEl.querySelector('.bailian-overlay-message').textContent = message;
+    if (langHint !== undefined) currentLangHint = langHint || '';
+
+    const msgEl = overlayEl.querySelector('.bailian-overlay-message');
+    if (currentLangHint) {
+      msgEl.innerHTML = `<div class="bailian-overlay-lang">${escapeHtml(currentLangHint)}</div>`
+        + `<div class="bailian-overlay-status">${escapeHtml(message)}</div>`;
+    } else {
+      msgEl.textContent = message;
+    }
+
     overlayEl.querySelector('.bailian-overlay-fill').style.width = `${progress}%`;
     overlayEl.style.display = 'block';
   }
 
+  function hideSelectionBubble() {
+    if (selectionBubbleOutsideHandler) {
+      document.removeEventListener('mousedown', selectionBubbleOutsideHandler, true);
+      selectionBubbleOutsideHandler = null;
+    }
+    if (selectionBubbleEl) {
+      selectionBubbleEl.remove();
+      selectionBubbleEl = null;
+    }
+  }
+
+  function showSelectionBubble(translated, rect, original = '') {
+    hideSelectionBubble();
+    ensureOverlayStyles();
+
+    selectionBubbleEl = document.createElement('div');
+    selectionBubbleEl.id = 'bailian-selection-bubble';
+    selectionBubbleEl.innerHTML = `
+      <div class="bailian-selection-label">Arya Translate</div>
+      <div class="bailian-selection-text">${escapeHtml(translated)}</div>
+      ${original ? `<div class="bailian-selection-original">${escapeHtml(original)}</div>` : ''}
+    `;
+    document.documentElement.appendChild(selectionBubbleEl);
+
+    const bubbleRect = selectionBubbleEl.getBoundingClientRect();
+    let top = rect.bottom + 8;
+    let left = Math.min(rect.left, window.innerWidth - bubbleRect.width - 12);
+    if (top + bubbleRect.height > window.innerHeight - 12) {
+      top = Math.max(12, rect.top - bubbleRect.height - 8);
+    }
+    left = Math.max(12, left);
+    selectionBubbleEl.style.top = `${top}px`;
+    selectionBubbleEl.style.left = `${left}px`;
+
+    selectionBubbleOutsideHandler = (event) => {
+      if (selectionBubbleEl && !selectionBubbleEl.contains(event.target)) {
+        hideSelectionBubble();
+      }
+    };
+    setTimeout(() => {
+      document.addEventListener('mousedown', selectionBubbleOutsideHandler, true);
+    }, 0);
+  }
+
   function hideOverlay() {
-    if (overlayEl) overlayEl.style.display = 'none';
+    if (overlayEl && isTopFrame) overlayEl.style.display = 'none';
   }
 
   function showCancelledAndHide() {
+    if (!isTopFrame) return;
     if (overlayEl) {
-      overlayEl.querySelector('.bailian-overlay-message').textContent = 'Arya stopped. See you next time 👋';
+      const msgEl = overlayEl.querySelector('.bailian-overlay-message');
+      if (currentLangHint) {
+        msgEl.innerHTML = `<div class="bailian-overlay-lang">${escapeHtml(currentLangHint)}</div>`
+          + `<div class="bailian-overlay-status">Arya stopped. See you next time 👋</div>`;
+      } else {
+        msgEl.textContent = 'Arya stopped. See you next time 👋';
+      }
       overlayEl.querySelector('.bailian-overlay-fill').style.width = '0%';
     }
     setTimeout(hideOverlay, 1200);
@@ -172,12 +342,12 @@
     return new Promise((resolve) => setTimeout(resolve, 0));
   }
 
-  async function collectTextNodesAsync(onProgress) {
+  async function collectTextNodesAsync(onProgress, targetLang) {
     const nodes = [];
     let scanned = 0;
 
     if (document.body) {
-      collectTextNodesFromRootTree(document.body, nodes);
+      collectTextNodesFromRootTree(document.body, nodes, targetLang);
       scanned = nodes.length;
       if (scanned >= 400) {
         onProgress(`Arya is scanning... ${scanned} segments found`);
@@ -189,7 +359,8 @@
   }
 
   async function collectMissedTextNodes() {
-    const all = await collectTextNodesAsync(() => {});
+    const settings = activeSettings || await getSettings();
+    const all = await collectTextNodesAsync(() => {}, settings.targetLang);
     return all.filter((node) => !translatedNodes.has(node));
   }
 
@@ -209,12 +380,14 @@
   function getSettings() {
     return new Promise((resolve) => {
       chrome.storage.sync.get(
-        { batchSize: 40, concurrency: 4, model: 'qwen-mt-flash' },
+        { batchSize: 40, concurrency: 4, model: 'qwen-mt-flash', targetLang: '简体中文' },
         (stored) => {
           const isMt = stored.model?.trim().toLowerCase().startsWith('qwen-mt');
           resolve({
             batchSize: Number(stored.batchSize) || 40,
             concurrency: Number(stored.concurrency) || 4,
+            model: stored.model || 'qwen-mt-flash',
+            targetLang: stored.targetLang || '简体中文',
             isMt
           });
         }
@@ -406,7 +579,9 @@
 
   function restoreOriginal() {
     stopWatchMode();
+    hideSelectionBubble();
     sessionId = null;
+    currentLangHint = '';
     isApplyingTranslation = true;
     try {
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -434,30 +609,34 @@
     showCancelledAndHide();
   }
 
-  function collectTextNodesFromRoot(root) {
+  function collectTextNodesFromRoot(root, targetLang) {
     const nodes = [];
     if (!root) return nodes;
 
     if (root.nodeType === Node.TEXT_NODE) {
       const text = root.textContent.trim();
-      if (text.length >= 2 && !shouldSkipNode(root)) nodes.push(root);
+      if (text.length >= 2 && !shouldSkipNode(root)
+        && !(targetLang && likelyAlreadyTargetLanguage(text, targetLang))) {
+        nodes.push(root);
+      }
       return nodes;
     }
 
     if (root.nodeType !== Node.ELEMENT_NODE || isOurOverlayElement(root)) return nodes;
 
-    collectTextNodesFromRootTree(root, nodes);
+    collectTextNodesFromRootTree(root, nodes, targetLang);
     return nodes;
   }
 
   function extractTextNodesFromMutations(records) {
+    const targetLang = activeSettings?.targetLang;
     const nodes = new Set();
     for (const record of records) {
       if (record.type === 'characterData' && record.target?.nodeType === Node.TEXT_NODE) {
-        collectTextNodesFromRoot(record.target).forEach((n) => nodes.add(n));
+        collectTextNodesFromRoot(record.target, targetLang).forEach((n) => nodes.add(n));
       }
       for (const node of record.addedNodes || []) {
-        collectTextNodesFromRoot(node).forEach((n) => nodes.add(n));
+        collectTextNodesFromRoot(node, targetLang).forEach((n) => nodes.add(n));
       }
     }
     return [...nodes];
@@ -500,14 +679,16 @@
         if (incremental) {
           showOverlay(
             `Translating new content... ${done}/${totalNodes}`,
-            Math.min(95, Math.round((done / totalNodes) * 100))
+            Math.min(95, Math.round((done / totalNodes) * 100)),
+            currentLangHint
           );
         } else {
           showOverlay(
             failCount
               ? `Retrying ${failCount} batch(es)... ${done}/${totalNodes}`
               : getAryaPhrase(),
-            Math.round((done / totalNodes) * 100)
+            Math.round((done / totalNodes) * 100),
+            currentLangHint
           );
         }
       },
@@ -593,7 +774,7 @@
 
     const onSpaNav = () => {
       if (!watchModeActive) return;
-      collectTextNodesAsync(() => {}).then((nodes) => {
+      collectTextNodesAsync(() => {}, settings.targetLang).then((nodes) => {
         if (nodes.length) queueIncrementalNodes(nodes);
       });
     };
@@ -606,7 +787,7 @@
       window.removeEventListener('hashchange', onSpaNav);
     };
 
-    collectTextNodesAsync(() => {}).then((nodes) => {
+    collectTextNodesAsync(() => {}, settings.targetLang).then((nodes) => {
       const missed = nodes.filter((n) => !translatedNodes.has(n));
       if (missed.length) queueIncrementalNodes(missed);
     });
@@ -655,7 +836,8 @@
           if (cancelRequested) return;
           showOverlay(
             phrase || getAryaPhrase(),
-            Math.round((completedNodes / Math.max(totalNodes, 1)) * 100)
+            Math.round((completedNodes / Math.max(totalNodes, 1)) * 100),
+            currentLangHint
           );
         });
 
@@ -744,25 +926,69 @@
     return { recovered: recoveredNodes, stillFailed };
   }
 
+  async function translateSelection(forcedText) {
+    hideSelectionBubble();
+    const selection = window.getSelection();
+    const text = (forcedText || selection?.toString() || '').trim();
+    if (!text || text.length < 2) {
+      return { success: false, error: '请先选中要翻译的文字' };
+    }
+
+    const settings = await getSettings();
+    let rect = { top: 80, left: 80, bottom: 100, right: 200 };
+    if (selection?.rangeCount) {
+      rect = selection.getRangeAt(0).getBoundingClientRect();
+    }
+
+    if (likelyAlreadyTargetLanguage(text, settings.targetLang)) {
+      showSelectionBubble(`Already in ${settings.targetLang} ✓`, rect, text);
+      return { success: true, skipped: true };
+    }
+
+    try {
+      if (!sessionId) sessionId = String(Date.now());
+      const translations = await translateBatchWithRetry([text]);
+      const translated = translations?.[0];
+      if (!isValidTranslation(translated)) {
+        return { success: false, error: '翻译失败，请重试' };
+      }
+      showSelectionBubble(translated, rect, text);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
   async function translatePage() {
     if (isTranslating) return { success: false, error: '正在翻译中，请稍候' };
 
     stopWatchMode();
+    hideSelectionBubble();
     isTranslating = true;
     cancelRequested = false;
     sessionId = String(Date.now());
     batchCounter = 0;
+    currentLangHint = '';
 
     try {
       const settings = await getSettings();
-      const textNodes = await collectTextNodesAsync((msg) => {
+      const scannedNodes = await collectTextNodesAsync((msg) => {
         showOverlay(msg, 0);
+      }, null);
+
+      const detectedSource = detectPageLanguage(scannedNodes);
+      currentLangHint = buildLangHint(detectedSource, settings.targetLang);
+
+      const textNodes = scannedNodes.filter((node) => {
+        const text = node.textContent.trim();
+        return !likelyAlreadyTargetLanguage(text, settings.targetLang);
       });
+
       if (textNodes.length === 0) {
-        return { success: false, error: '未找到可翻译的文本' };
+        return { success: false, error: '未找到需要翻译的文本（可能已是目标语言）' };
       }
 
-      showOverlay(getAryaPhrase(), 0);
+      showOverlay(getAryaPhrase(), 0, currentLangHint);
 
       const result = await translateNodeList(textNodes, settings, { incremental: false });
 
@@ -809,6 +1035,12 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.action === 'translateSelection') {
+      const text = (message.selectionText || window.getSelection()?.toString() || '').trim();
+      if (!text || text.length < 2) return false;
+      translateSelection(text).then(sendResponse);
+      return true;
+    }
     if (message.action === 'translate') {
       translatePage().then(sendResponse);
       return true;

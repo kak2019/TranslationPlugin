@@ -30,7 +30,7 @@ async function sendToContentScript(tabId, action, extra = {}) {
     return await chrome.tabs.sendMessage(tabId, { action, ...extra });
   } catch {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       files: ['content/content.js']
     });
     return chrome.tabs.sendMessage(tabId, { action, ...extra });

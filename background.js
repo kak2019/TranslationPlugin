@@ -722,18 +722,53 @@ chrome.runtime.onInstalled.addListener(() => {
     title: 'Arya: Translate this page',
     contexts: ['page']
   });
+  chrome.contextMenus.create({
+    id: 'arya-translate-selection',
+    title: 'Arya: Translate selection',
+    contexts: ['selection']
+  });
+});
+
+async function injectContentScripts(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: ['content/content.js']
+  });
+}
+
+async function sendToTab(tabId, action, extra = {}) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, { action, ...extra });
+  } catch {
+    await injectContentScripts(tabId);
+    return chrome.tabs.sendMessage(tabId, { action, ...extra });
+  }
+}
+
+chrome.commands.onCommand.addListener(async (command) => {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) return;
+  if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return;
+
+  const actionMap = {
+    'translate-page': 'translate',
+    'translate-selection': 'translateSelection',
+    'restore-page': 'restore'
+  };
+  const action = actionMap[command];
+  if (action) await sendToTab(tab.id, action);
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'arya-translate-page' || !tab?.id) return;
-  try {
-    await chrome.tabs.sendMessage(tab.id, { action: 'translate' });
-  } catch {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content/content.js']
-    });
-    await chrome.tabs.sendMessage(tab.id, { action: 'translate' });
+  if (!tab?.id) return;
+
+  if (info.menuItemId === 'arya-translate-page') {
+    await sendToTab(tab.id, 'translate');
+    return;
+  }
+
+  if (info.menuItemId === 'arya-translate-selection') {
+    await sendToTab(tab.id, 'translateSelection', { selectionText: info.selectionText || '' });
   }
 });
 
