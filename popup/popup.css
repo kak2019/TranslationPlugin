@@ -101,6 +101,12 @@ header h1 {
   color: #fff;
 }
 
+.btn.primary.outline {
+  background: #fff;
+  color: #6366f1;
+  border: 1px solid #c7d2fe;
+}
+
 .btn.secondary {
   background: #fff;
   color: #6366f1;

@@ -1,6 +1,7 @@
 const modelSelect = document.getElementById('modelSelect');
 const targetLangSelect = document.getElementById('targetLang');
 const translateBtn = document.getElementById('translateBtn');
+const translateSelectionBtn = document.getElementById('translateSelectionBtn');
 const cancelBtn = document.getElementById('cancelBtn');
 const restoreBtn = document.getElementById('restoreBtn');
 const statusEl = document.getElementById('status');
@@ -17,7 +18,13 @@ function showStatus(message, type = 'info') {
 
 function setTranslating(active) {
   translateBtn.disabled = active;
+  translateSelectionBtn.disabled = active;
   cancelBtn.classList.toggle('hidden', !active);
+}
+
+function formatUsage(result) {
+  if (!result?.estimatedTokens) return '';
+  return ` · 约 ${result.estimatedTokens.toLocaleString()} tokens`;
 }
 
 async function getActiveTab() {
@@ -39,8 +46,8 @@ async function sendToContentScript(tabId, action, extra = {}) {
 
 function updateModelHint(modelId) {
   const provider = getModelProvider(modelId);
-  const providerMap = { bailian: 'Qwen / Bailian', deepseek: 'DeepSeek', xiaomi: 'MiMo' };
-  const providerName = providerMap[provider] || PROVIDERS[provider]?.name || 'Bailian';
+  const providerMap = { bailian: '百炼 / 通义', deepseek: 'DeepSeek', xiaomi: '小米 MiMo' };
+  const providerName = providerMap[provider] || PROVIDERS[provider]?.name || '百炼';
   modelSubtitle.textContent = `${getModelName(modelId)} · ${providerName}`;
 }
 
@@ -52,9 +59,9 @@ function updateAccessHint(config, modelId) {
 
   if (config.usingHostedKey && isBailianMt) {
     paymentBanner.classList.remove('hidden');
-    paymentBannerText.textContent = 'Arya is free! Support the author 💙';
-    upgradeBtn.textContent = 'Donate';
-    modelSubtitle.textContent = `${config.modelName || ''} · Free`;
+    paymentBannerText.textContent = 'Arya 完全免费，欢迎支持作者 💙';
+    upgradeBtn.textContent = '打赏';
+    modelSubtitle.textContent = `${config.modelName || ''} · 免费`;
     return;
   }
 
@@ -78,7 +85,7 @@ async function init() {
       const isBailianMt = provider === 'bailian' && stored.model?.trim().toLowerCase().startsWith('qwen-mt');
       if (!isBailianMt) {
         const name = PROVIDERS[provider]?.name || '对应厂商';
-        showStatus(`Please set up your ${name} API Key in Settings`, 'error');
+        showStatus(`请先在设置中配置 ${name} API Key`, 'error');
       }
     }
     updateAccessHint(config, stored.model);
@@ -90,7 +97,7 @@ async function init() {
       const state = await sendToContentScript(tab.id, 'getTranslating');
       if (state?.isTranslating) {
         setTranslating(true);
-        showStatus('Arya is translating...', 'info');
+        showStatus('Arya 正在翻译…', 'info');
       }
     } catch {
       // ignore
@@ -107,16 +114,16 @@ targetLangSelect.addEventListener('change', () => {
   chrome.storage.sync.set({ targetLang: targetLangSelect.value });
 });
 
-translateBtn.addEventListener('click', async () => {
+async function runTranslation(action) {
   setTranslating(true);
-  showStatus('Let Arya be your eyes... ✨', 'info');
+  showStatus('Arya 正在为你翻译… ✨', 'info');
 
   try {
     const tab = await getActiveTab();
-    if (!tab?.id) throw new Error('Cannot access current tab');
+    if (!tab?.id) throw new Error('无法访问当前标签页');
 
     if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) {
-      throw new Error('Cannot translate built-in browser pages');
+      throw new Error('无法翻译浏览器内置页面');
     }
 
     await chrome.storage.sync.set({
@@ -124,32 +131,38 @@ translateBtn.addEventListener('click', async () => {
       model: modelSelect.value
     });
 
-    const result = await sendToContentScript(tab.id, 'translate');
+    const result = await sendToContentScript(tab.id, action, {
+      useCached: action === 'translateSelection'
+    });
 
     if (result?.cancelled) {
-      showStatus('Arya stopped. See you next time 👋', 'info');
+      showStatus('Arya 已停止，下次见 👋', 'info');
     } else if (result?.success) {
+      const usage = formatUsage(result);
       if (result.warning) {
-        showStatus(result.warning, 'info');
+        showStatus(`${result.warning}${usage}`, 'info');
       } else {
-        showStatus(`Done! Arya translated ${result.count} segments ✓`, 'success');
+        showStatus(`完成！已翻译 ${result.count} 段${usage} ✓`, 'success');
       }
     } else {
-      showStatus(result?.error || 'Translation failed', 'error');
+      showStatus(result?.error || '翻译失败', 'error');
     }
   } catch (error) {
     showStatus(error.message, 'error');
   } finally {
     setTranslating(false);
   }
-});
+}
+
+translateBtn.addEventListener('click', () => runTranslation('translate'));
+translateSelectionBtn.addEventListener('click', () => runTranslation('translateSelection'));
 
 cancelBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
     if (!tab?.id) return;
     await sendToContentScript(tab.id, 'cancel');
-    showStatus('Arya stopped. See you next time 👋', 'info');
+    showStatus('Arya 已停止，下次见 👋', 'info');
     setTranslating(false);
   } catch (error) {
     showStatus(error.message, 'error');
@@ -161,7 +174,7 @@ restoreBtn.addEventListener('click', async () => {
     const tab = await getActiveTab();
     if (!tab?.id) return;
     await sendToContentScript(tab.id, 'restore');
-    showStatus('Original text restored ✓', 'success');
+    showStatus('已恢复原文 ✓', 'success');
   } catch (error) {
     showStatus(error.message, 'error');
   }
@@ -173,7 +186,7 @@ settingsLink.addEventListener('click', (e) => {
 });
 
 upgradeBtn.addEventListener('click', () => {
-  chrome.runtime.sendMessage({ action: 'openAfdianPage' }); // open donation page
+  chrome.runtime.sendMessage({ action: 'openAfdianPage' });
 });
 
 init();

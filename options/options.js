@@ -65,7 +65,7 @@ async function loadSettings() {
     deepseekApiKey: '',
     xiaomiApiKey: '',
     model: 'qwen-mt-flash',
-    batchSize: 10,
+    batchSize: 40,
     concurrency: 4
   });
 

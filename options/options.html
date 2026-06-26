@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Arya Translate — Settings</title>
+  <title>Arya Translate — 设置</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -92,20 +92,20 @@
 <body>
   <div class="wrap">
     <h1>Arya Translate</h1>
-    <p class="desc" style="font-size:13px;color:#888;margin-bottom:4px">AI Web Translator · Powered by Qwen-MT</p>
-    <p class="desc">Different providers use their own API keys. Qwen-MT uses Bailian; DeepSeek and MiMo use their own platforms.</p>
+    <p class="desc" style="font-size:13px;color:#888;margin-bottom:4px">AI 网页翻译 · 由 Qwen-MT 驱动</p>
+    <p class="desc">不同厂商使用各自的 API Key。Qwen-MT 走百炼；DeepSeek、小米 MiMo 走各自官方平台。</p>
 
     <div class="info">
       Qwen-MT 开箱即用，无需填写 Key。如需使用通义千问 / DeepSeek / MiMo 等模型，请在下方填写对应 API Key。
     </div>
 
     <div class="card">
-      <h2>Support the Author (Optional)</h2>
+      <h2>支持作者（可选）</h2>
       <div class="plan-box">
-        <div class="plan-status">Arya Translate is free ✨</div>
-        <p class="hint">If Arya helped you, feel free to buy me a coffee — any amount is appreciated. Completely optional, never affects functionality.</p>
+        <div class="plan-status">Arya Translate 完全免费 ✨</div>
+        <p class="hint">如果 Arya 帮到了你，欢迎请我喝杯咖啡——任意金额都是鼓励。完全自愿，不影响任何功能。</p>
         <div class="plan-actions">
-          <button type="button" id="afdianBtn">Open Afdian Donation Page</button>
+          <button type="button" id="afdianBtn">打开爱发电打赏页</button>
         </div>
         <p class="hint" style="margin-top:10px">
           <a id="afdianLink" href="#" target="_blank" rel="noopener">ifdian.net/a/flynt</a>
@@ -169,9 +169,10 @@
         <label for="batchSize">每批文本段数（通用 LLM）</label>
         <select id="batchSize">
           <option value="5">5</option>
-          <option value="10">10（推荐）</option>
+          <option value="10">10</option>
           <option value="15">15</option>
           <option value="25">25</option>
+          <option value="40">40（推荐）</option>
         </select>
       </div>
       <div class="field">
@@ -192,10 +193,10 @@
     </div>
 
     <div class="card support-card">
-      <h2>☕ Buy Me a Coffee (WeChat)</h2>
+      <h2>☕ 微信赞赏</h2>
       <p class="support-desc">
-        Scan the QR code to tip — <strong>any amount</strong> means a lot to me.<br>
-        Your support keeps Arya alive and improving. Thank you! 💙
+        扫码打赏，<strong>任意金额</strong>都是对我的鼓励。<br>
+        你的支持让 Arya 持续改进。谢谢！💙
       </p>
       <div class="support-qr-wrap">
         <img id="donateQr" class="support-qr" alt="微信赞赏二维码" width="180" height="180">
@@ -205,10 +206,10 @@
     </div>
 
     <p class="arya-easter-egg">
-      Arya is proudly named after my girlfriend. ❤️<br>
-      Hope it helps you read the world better.
+      Arya 以我女朋友的名字命名。❤️<br>
+      希望它帮你更好地阅读这个世界。
     </p>
-    <p class="arya-version-note">v2.1.0 — Tabs, lazy load, and fewer missed translations. 💕</p>
+    <p class="arya-version-note">v2.2.0 — 划词翻译、属性翻译、同源 iframe、Token 估算。</p>
   </div>
   <script src="../shared/models.js"></script>
   <script src="../shared/afdian.js"></script>
