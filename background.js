@@ -719,22 +719,60 @@ async function translateBatch(texts, requestId, streamCallback = null) {
   return { translations, usage: computeBatchUsage(texts) };
 }
 
-async function sendToContentScript(tabId, action, extra = {}) {
-  const payload = { action, ...extra };
+async function ensureContentScripts(tabId) {
   try {
-    return await chrome.tabs.sendMessage(tabId, payload);
+    await chrome.tabs.sendMessage(tabId, { action: 'ping' });
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ['content/content.js']
     });
-    return chrome.tabs.sendMessage(tabId, payload);
   }
+}
+
+async function sendToContentScript(tabId, action, extra = {}) {
+  const payload = { action, ...extra };
+  await ensureContentScripts(tabId);
+  return chrome.tabs.sendMessage(tabId, payload);
+}
+
+async function broadcastToContentScript(tabId, action, extra = {}) {
+  const payload = { action, ...extra };
+  await ensureContentScripts(tabId);
+
+  if (action === 'cancel') {
+    cancelAllActiveSessions();
+  }
+
+  let frames;
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId });
+  } catch {
+    frames = [];
+  }
+  const targets = frames?.length ? frames : [{ frameId: 0 }];
+
+  const results = await Promise.allSettled(
+    targets.map(({ frameId }) => chrome.tabs.sendMessage(tabId, payload, { frameId }))
+  );
+
+  const responses = results
+    .filter((r) => r.status === 'fulfilled' && r.value != null)
+    .map((r) => r.value);
+
+  if (!responses.length) return { success: true };
+  return responses.find((r) => r.success === false) || responses[0];
 }
 
 function cancelSession(sessionId) {
   for (const [id, controller] of abortControllers.entries()) {
     if (id.startsWith(`${sessionId}-`)) controller.abort();
+  }
+}
+
+function cancelAllActiveSessions() {
+  for (const controller of abortControllers.values()) {
+    controller.abort();
   }
 }
 
@@ -770,7 +808,7 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   } else if (command === 'translate-selection') {
     await sendToContentScript(tab.id, 'translateSelection');
   } else if (command === 'restore-page') {
-    await sendToContentScript(tab.id, 'restore');
+    await broadcastToContentScript(tab.id, 'restore');
   }
 });
 
@@ -826,6 +864,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'openAfdianPage') {
     chrome.tabs.create({ url: getAfdianPageUrl(), active: true });
     sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.action === 'broadcastToContent') {
+    const { tabId, contentAction, extra } = message;
+    if (!tabId || !contentAction) {
+      sendResponse({ success: false, error: '缺少 tabId 或 contentAction' });
+      return true;
+    }
+    broadcastToContentScript(tabId, contentAction, extra || {})
+      .then((result) => sendResponse(result ?? { success: true }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 

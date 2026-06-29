@@ -5,19 +5,23 @@
 ## 功能
 
 - **整页翻译**：翻译当前页面可见文本
-- **划词翻译**：选中文字后翻译（弹窗按钮 / 右键菜单 / `Alt+Shift+T`）
+- **划词翻译**：选中文字后翻译（弹窗按钮 / 右键菜单 / 快捷键）
 - **HTML 属性翻译**：`title`、`placeholder`、`alt`、`aria-label`
-- **同源 iframe**：自动翻译同域 iframe 内正文
+- **iframe 支持**：同源 iframe 由顶层页面统一遍历翻译；跨域 iframe 由各自 frame 内的脚本独立翻译
+- **跳过目标语言**：已是目标语言的段落自动跳过，减少无效请求
 - **多模型 / 多厂商**：Qwen-MT、通义千问、DeepSeek、小米 MiMo、Kimi、GLM 等
 - **并行翻译**：多批请求同时发送，显著提速
 - **流式渐进显示**：Qwen-MT 边译边显示
-- **取消翻译**：翻译过程中可随时取消
+- **取消翻译**：翻译过程中可随时取消（所有 frame 同步停止）
 - **动态补译**：翻译完成后自动监听新内容（Watch 模式）
 - **Token 估算**：完成后显示本次约消耗 tokens
 - 支持多种目标语言
-- 一键恢复原文
+- **一键恢复原文**：主页面与 iframe 内译文一并还原
 - 右键菜单「Arya：翻译此页面 / 翻译选中文本」
-- 快捷键：`Alt+T` 整页翻译，`Alt+Shift+T` 划词翻译
+- **快捷键**（可在 `chrome://extensions/shortcuts` 自定义）：
+  - `Ctrl+Shift+Y` — 翻译当前页面
+  - `Ctrl+Shift+E` — 翻译选中文本
+  - `Ctrl+Shift+U` — 恢复原文
 
 ## 安装步骤
 
@@ -83,14 +87,26 @@ TranslationPlugin/
 │   └── content.js      # 页面文本提取、属性、划词翻译
 ├── popup/              # 插件弹窗
 ├── options/            # API Key 设置页
+├── scripts/            # 图标生成脚本（开发用）
 └── icons/
 ```
+
+### 开发依赖（可选）
+
+重新生成图标时，在项目根目录执行：
+
+```bash
+npm install
+node scripts/gen-icons.mjs
+```
+
+`node_modules` 已加入 `.gitignore`，不会提交到仓库。
 
 ## 注意事项
 
 - 翻译会消耗对应厂商 API 额度；Token 数为估算值（字符数 ÷ 3.5），仅供参考
 - API Key 保存在 `chrome.storage.sync`，请勿在公共设备上使用
-- 插件会跳过 `<script>`、`<style>`、`<code>` 等区域
-- 跨域 iframe 因浏览器安全限制无法翻译
+- 插件会跳过 `<script>`、`<style>`、`<code>` 等区域；带 `notranslate` 类名的元素也会跳过
+- **iframe**：同源 iframe 由顶层 frame 递归翻译；跨域 iframe 需各自 frame 注入内容脚本（已启用 `all_frames`），顶层页面无法直接读写跨域 DOM
 - 动态加载的内容在首次整页翻译后会自动补译（Watch 模式）
-- 点击「恢复原文」可还原页面
+- 「恢复原文」与「取消翻译」会广播到标签页内所有 frame，确保 iframe 内译文一并还原或停止

@@ -32,6 +32,21 @@ async function getActiveTab() {
   return tab;
 }
 
+async function broadcastToContentScript(tabId, contentAction, extra = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'broadcastToContent', tabId, contentAction, extra },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+
 async function sendToContentScript(tabId, action, extra = {}) {
   try {
     return await chrome.tabs.sendMessage(tabId, { action, ...extra });
@@ -161,7 +176,7 @@ cancelBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
     if (!tab?.id) return;
-    await sendToContentScript(tab.id, 'cancel');
+    await broadcastToContentScript(tab.id, 'cancel');
     showStatus('Arya 已停止，下次见 👋', 'info');
     setTranslating(false);
   } catch (error) {
@@ -173,8 +188,9 @@ restoreBtn.addEventListener('click', async () => {
   try {
     const tab = await getActiveTab();
     if (!tab?.id) return;
-    await sendToContentScript(tab.id, 'restore');
+    await broadcastToContentScript(tab.id, 'restore');
     showStatus('已恢复原文 ✓', 'success');
+    setTranslating(false);
   } catch (error) {
     showStatus(error.message, 'error');
   }
