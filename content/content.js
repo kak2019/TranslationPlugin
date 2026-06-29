@@ -28,6 +28,20 @@
   const SKIP_ANCESTOR_CLASSES = new Set(['sr-only', 'visually-hidden', 'notranslate']);
   const isTopFrame = window === window.top;
 
+  function isCrossOriginSubframe() {
+    if (isTopFrame) return false;
+    try {
+      void window.parent.document;
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  function shouldHandlePageTranslate() {
+    return isTopFrame || isCrossOriginSubframe();
+  }
+
   let isTranslating = false;
   let isProcessingIncremental = false;
   let isApplyingTranslation = false;
@@ -43,6 +57,8 @@
   let sessionUsage = { inputChars: 0, estimatedTokens: 0 };
   let cachedSelection = null;
   let currentLangHint = '';
+  let selectionBubbleEl = null;
+  let selectionBubbleRaf = null;
 
   function escapeHtml(text) {
     return String(text)
@@ -124,21 +140,136 @@
 
   function updateCachedSelection() {
     const sel = window.getSelection();
-    if (!sel?.rangeCount || sel.isCollapsed) return;
+    if (!sel?.rangeCount || sel.isCollapsed) {
+      hideSelectionBubble();
+      return;
+    }
     const text = sel.toString().trim();
-    if (!text) return;
+    if (!text) {
+      hideSelectionBubble();
+      return;
+    }
     try {
       cachedSelection = {
         text,
         range: sel.getRangeAt(0).cloneRange()
       };
+      scheduleSelectionBubble();
     } catch {
-      // ignore
+      hideSelectionBubble();
     }
+  }
+
+  function isOurBubbleElement(el) {
+    return el?.id === 'arya-selection-bubble' || Boolean(el?.closest?.('#arya-selection-bubble'));
+  }
+
+  function hideSelectionBubble() {
+    if (selectionBubbleRaf) {
+      cancelAnimationFrame(selectionBubbleRaf);
+      selectionBubbleRaf = null;
+    }
+    if (selectionBubbleEl) {
+      selectionBubbleEl.remove();
+      selectionBubbleEl = null;
+    }
+  }
+
+  function isSelectionInEditableContext(range) {
+    let node = range.commonAncestorContainer;
+    if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+    while (node) {
+      if (SKIP_TAGS.has(node.tagName)) return true;
+      if (node.isContentEditable) return true;
+      if (shouldSkipElement(node)) return true;
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  function scheduleSelectionBubble() {
+    if (selectionBubbleRaf) cancelAnimationFrame(selectionBubbleRaf);
+    selectionBubbleRaf = requestAnimationFrame(() => {
+      selectionBubbleRaf = null;
+      showSelectionBubble();
+    });
+  }
+
+  function showSelectionBubble() {
+    if (isTranslating || isProcessingIncremental) return;
+
+    const sel = window.getSelection();
+    if (!sel?.rangeCount || sel.isCollapsed) {
+      hideSelectionBubble();
+      return;
+    }
+
+    const text = sel.toString().trim();
+    if (!text || text.length < 2 || isLikelyNonTranslatable(text)) {
+      hideSelectionBubble();
+      return;
+    }
+
+    let range;
+    try {
+      range = sel.getRangeAt(0);
+      if (isSelectionInEditableContext(range)) {
+        hideSelectionBubble();
+        return;
+      }
+    } catch {
+      hideSelectionBubble();
+      return;
+    }
+
+    ensureOverlayStyles();
+    hideSelectionBubble();
+
+    const rect = range.getBoundingClientRect();
+    if (!rect.width && !rect.height) {
+      hideSelectionBubble();
+      return;
+    }
+
+    const bubble = document.createElement('div');
+    bubble.id = 'arya-selection-bubble';
+    bubble.innerHTML = '<button type="button" class="arya-bubble-btn" title="翻译选中文本">译</button>';
+
+    const left = Math.min(Math.max(rect.right + 8, 8), window.innerWidth - 44);
+    const top = Math.max(rect.top - 36, 8);
+    bubble.style.left = `${left}px`;
+    bubble.style.top = `${top}px`;
+
+    bubble.querySelector('.arya-bubble-btn').addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    bubble.querySelector('.arya-bubble-btn').addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      hideSelectionBubble();
+      translateSelection().then((result) => {
+        if (result?.success) {
+          const usage = formatUsageSuffix();
+          showOverlay(`完成！已翻译选中内容${usage}`, 100);
+          setTimeout(hideOverlay, 1800);
+        } else if (result?.error && !result?.cancelled) {
+          showOverlay(result.error, 0);
+          setTimeout(hideOverlay, 2200);
+        }
+      });
+    });
+
+    document.documentElement.appendChild(bubble);
+    selectionBubbleEl = bubble;
   }
 
   document.addEventListener('mouseup', updateCachedSelection, true);
   document.addEventListener('keyup', updateCachedSelection, true);
+  document.addEventListener('scroll', hideSelectionBubble, true);
+  document.addEventListener('mousedown', (e) => {
+    if (!isOurBubbleElement(e.target)) hideSelectionBubble();
+  }, true);
 
   function resetSessionUsage() {
     sessionUsage = { inputChars: 0, estimatedTokens: 0 };
@@ -157,7 +288,8 @@
 
   function isOurOverlayElement(el) {
     return el?.id === 'bailian-translate-overlay' || el?.id === 'bailian-translate-styles'
-      || Boolean(el?.closest?.('#bailian-translate-overlay'));
+      || Boolean(el?.closest?.('#bailian-translate-overlay'))
+      || isOurBubbleElement(el);
   }
 
   function shouldSkipElement(el) {
@@ -224,7 +356,7 @@
     }
   }
 
-  function collectAttrItemsFromRoot(root, items) {
+  function collectAttrItemsFromRoot(root, items, targetLang) {
     if (!root) return;
 
     const elWalker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
@@ -235,13 +367,15 @@
         const val = el.getAttribute(attr);
         if (!val || val.trim().length < 2) continue;
         if (isAttrAlreadyTranslated(el, attr)) continue;
-        items.push({ element: el, attr, text: val.trim() });
+        const text = val.trim();
+        if (targetLang && likelyAlreadyTargetLanguage(text, targetLang)) continue;
+        items.push({ element: el, attr, text });
       }
-      if (el.shadowRoot) collectAttrItemsFromRoot(el.shadowRoot, items);
+      if (el.shadowRoot) collectAttrItemsFromRoot(el.shadowRoot, items, targetLang);
       if (el.tagName === 'IFRAME') {
         try {
           const iframeBody = el.contentDocument?.body;
-          if (iframeBody) collectAttrItemsFromRoot(iframeBody, items);
+          if (iframeBody) collectAttrItemsFromRoot(iframeBody, items, targetLang);
         } catch {
           // 跨域 iframe
         }
@@ -453,6 +587,23 @@
       .bailian-overlay-status { font-size: 11px; color: #555; line-height: 1.5; }
       .bailian-overlay-bar { height: 3px; background: #eee; border-radius: 2px; overflow: hidden; }
       .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: 0%; transition: width 0.3s; }
+      #arya-selection-bubble {
+        position: fixed; z-index: 2147483646;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        pointer-events: auto;
+      }
+      #arya-selection-bubble .arya-bubble-btn {
+        border: none; cursor: pointer;
+        width: 32px; height: 32px; border-radius: 16px;
+        background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        color: #fff; font-size: 13px; font-weight: 700;
+        box-shadow: 0 4px 14px rgba(99,102,241,0.35);
+        transition: transform 0.12s, box-shadow 0.12s;
+      }
+      #arya-selection-bubble .arya-bubble-btn:hover {
+        transform: scale(1.06);
+        box-shadow: 0 6px 18px rgba(99,102,241,0.45);
+      }
     `;
     document.head.appendChild(style);
   }
@@ -530,9 +681,9 @@
     return nodes;
   }
 
-  async function collectAttrItemsAsync() {
+  async function collectAttrItemsAsync(targetLang) {
     const items = [];
-    if (document.body) collectAttrItemsFromRoot(document.body, items);
+    if (document.body) collectAttrItemsFromRoot(document.body, items, targetLang);
     return items;
   }
 
@@ -828,6 +979,7 @@
 
   function restoreOriginal() {
     stopWatchMode();
+    hideSelectionBubble();
     sessionId = null;
     resetSessionUsage();
     isApplyingTranslation = true;
@@ -849,6 +1001,7 @@
 
   function cancelTranslation() {
     cancelRequested = true;
+    hideSelectionBubble();
     const sid = sessionId;
     stopWatchMode();
     if (sid) {
@@ -1266,6 +1419,8 @@
   async function translateSelection(message = {}) {
     if (isTranslating) return { success: false, error: '正在翻译中，请稍候' };
 
+    hideSelectionBubble();
+
     const resolved = resolveSelectionRange(message);
     if (!resolved) {
       return { success: false, error: '未检测到选中文本，请先在页面上拖选文字' };
@@ -1321,6 +1476,8 @@
   async function translatePage() {
     if (isTranslating) return { success: false, error: '正在翻译中，请稍候' };
 
+    hideSelectionBubble();
+
     stopWatchMode();
     isTranslating = true;
     cancelRequested = false;
@@ -1343,7 +1500,7 @@
         const text = node.textContent.trim();
         return !likelyAlreadyTargetLanguage(text, settings.targetLang);
       });
-      const attrItems = await collectAttrItemsAsync();
+      const attrItems = await collectAttrItemsAsync(settings.targetLang);
       if (textNodes.length === 0 && attrItems.length === 0) {
         return { success: false, error: '未找到需要翻译的文本（可能已是目标语言）' };
       }
@@ -1408,6 +1565,10 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.action === 'translate') {
+      if (!shouldHandlePageTranslate()) {
+        sendResponse({ success: true, skipped: true, count: 0 });
+        return true;
+      }
       translatePage().then(sendResponse);
       return true;
     }

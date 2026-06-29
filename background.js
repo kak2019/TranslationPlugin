@@ -1,5 +1,3 @@
-// ExtensionPay 已停用，改用爱发电（shared/afdian.js）
-// importScripts('ExtPay.js', 'shared/billing.js');
 importScripts('shared/afdian.js', 'shared/hosted-key.js', 'shared/models.js', 'shared/providers.js');
 
 async function getEffectiveBailianApiKeys(config) {
@@ -721,7 +719,7 @@ async function translateBatch(texts, requestId, streamCallback = null) {
 
 async function ensureContentScripts(tabId) {
   try {
-    await chrome.tabs.sendMessage(tabId, { action: 'ping' });
+    await chrome.tabs.sendMessage(tabId, { action: 'ping' }, { frameId: 0 });
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
@@ -730,10 +728,154 @@ async function ensureContentScripts(tabId) {
   }
 }
 
+function frameOriginsMatch(a, b) {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+async function getPageTranslateFrameIds(tabId) {
+  let frames = [];
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId });
+  } catch {
+    return [0];
+  }
+  if (!frames.length) return [0];
+
+  const tab = await chrome.tabs.get(tabId);
+  const byId = new Map(frames.map((f) => [f.frameId, f]));
+  const ids = new Set([0]);
+
+  for (const frame of frames) {
+    if (frame.frameId === 0) continue;
+    const parent = byId.get(frame.parentFrameId);
+    const parentUrl = parent?.url || tab.url || '';
+    const frameUrl = frame.url || '';
+    // 顶层页面下的 about:blank 同源 iframe 由主 frame DOM 遍历覆盖
+    if (frameUrl.startsWith('about:') && parent?.frameId === 0) continue;
+    if (!frameOriginsMatch(parentUrl, frameUrl)) {
+      ids.add(frame.frameId);
+    }
+  }
+
+  return [...ids];
+}
+
+function mergePageTranslateResults(results) {
+  let totalCount = 0;
+  let totalTokens = 0;
+  let totalInputChars = 0;
+  let success = false;
+  let cancelled = false;
+  let error = null;
+  let warning = null;
+
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !r.value) continue;
+    const v = r.value;
+    if (v.skipped) continue;
+    if (v.cancelled) cancelled = true;
+    if (v.success) {
+      success = true;
+      totalCount += v.count || 0;
+      totalTokens += v.estimatedTokens || 0;
+      totalInputChars += v.inputChars || 0;
+      if (v.warning) warning = warning ? `${warning}；${v.warning}` : v.warning;
+    } else if (v.error) {
+      error = v.error;
+    }
+  }
+
+  if (cancelled) return { success: false, cancelled: true, error: '翻译已取消' };
+  if (success) {
+    return {
+      success: true,
+      count: totalCount,
+      estimatedTokens: totalTokens,
+      inputChars: totalInputChars,
+      warning
+    };
+  }
+  return { success: false, error: error || '未找到需要翻译的文本（可能已是目标语言）' };
+}
+
+async function sendPageTranslate(tabId, extra = {}) {
+  const payload = { action: 'translate', ...extra };
+  await ensureContentScripts(tabId);
+  const frameIds = await getPageTranslateFrameIds(tabId);
+
+  const results = await Promise.allSettled(
+    frameIds.map((frameId) => chrome.tabs.sendMessage(tabId, payload, { frameId }))
+  );
+
+  return mergePageTranslateResults(results);
+}
+
+async function sendSelectionTranslate(tabId, extra = {}) {
+  const payload = { action: 'translateSelection', ...extra };
+  await ensureContentScripts(tabId);
+
+  let frames;
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId });
+  } catch {
+    frames = [];
+  }
+  const targets = frames?.length ? frames : [{ frameId: 0 }];
+
+  const results = await Promise.allSettled(
+    targets.map(({ frameId }) => chrome.tabs.sendMessage(tabId, payload, { frameId }))
+  );
+
+  const successes = results
+    .filter((r) => r.status === 'fulfilled' && r.value?.success)
+    .map((r) => r.value);
+  if (successes.length) return successes[0];
+
+  const withError = results
+    .filter((r) => r.status === 'fulfilled' && r.value && !r.value.success)
+    .map((r) => r.value);
+  const noSelection = withError.find((v) => v.error?.includes('未检测'));
+  if (noSelection && withError.length === targets.length) return noSelection;
+
+  return withError[0] || { success: false, error: '未检测到选中文本，请先在页面上拖选文字' };
+}
+
+async function queryTranslatingState(tabId) {
+  await ensureContentScripts(tabId);
+
+  let frames;
+  try {
+    frames = await chrome.webNavigation.getAllFrames({ tabId });
+  } catch {
+    frames = [];
+  }
+  const targets = frames?.length ? frames : [{ frameId: 0 }];
+
+  const results = await Promise.allSettled(
+    targets.map(({ frameId }) =>
+      chrome.tabs.sendMessage(tabId, { action: 'getTranslating' }, { frameId })
+    )
+  );
+
+  let isTranslating = false;
+  let watchModeActive = false;
+  for (const r of results) {
+    if (r.status !== 'fulfilled' || !r.value) continue;
+    if (r.value.isTranslating) isTranslating = true;
+    if (r.value.watchModeActive) watchModeActive = true;
+  }
+
+  return { isTranslating, watchModeActive };
+}
+
 async function sendToContentScript(tabId, action, extra = {}) {
   const payload = { action, ...extra };
   await ensureContentScripts(tabId);
-  return chrome.tabs.sendMessage(tabId, payload);
+  return chrome.tabs.sendMessage(tabId, payload, { frameId: 0 });
 }
 
 async function broadcastToContentScript(tabId, action, extra = {}) {
@@ -792,9 +934,9 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   if (info.menuItemId === 'arya-translate-page') {
-    await sendToContentScript(tab.id, 'translate');
+    await sendPageTranslate(tab.id);
   } else if (info.menuItemId === 'arya-translate-selection') {
-    await sendToContentScript(tab.id, 'translateSelection', {
+    await sendSelectionTranslate(tab.id, {
       selectionText: info.selectionText || ''
     });
   }
@@ -804,9 +946,9 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   if (!tab?.id) return;
   if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return;
   if (command === 'translate-page') {
-    await sendToContentScript(tab.id, 'translate');
+    await sendPageTranslate(tab.id);
   } else if (command === 'translate-selection') {
-    await sendToContentScript(tab.id, 'translateSelection');
+    await sendSelectionTranslate(tab.id);
   } else if (command === 'restore-page') {
     await broadcastToContentScript(tab.id, 'restore');
   }
@@ -864,6 +1006,42 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'openAfdianPage') {
     chrome.tabs.create({ url: getAfdianPageUrl(), active: true });
     sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.action === 'queryTranslating') {
+    const { tabId } = message;
+    if (!tabId) {
+      sendResponse({ isTranslating: false, watchModeActive: false });
+      return true;
+    }
+    queryTranslatingState(tabId)
+      .then((state) => sendResponse(state))
+      .catch(() => sendResponse({ isTranslating: false, watchModeActive: false }));
+    return true;
+  }
+
+  if (message.action === 'pageTranslate') {
+    const { tabId, extra } = message;
+    if (!tabId) {
+      sendResponse({ success: false, error: '缺少 tabId' });
+      return true;
+    }
+    sendPageTranslate(tabId, extra || {})
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'selectionTranslate') {
+    const { tabId, extra } = message;
+    if (!tabId) {
+      sendResponse({ success: false, error: '缺少 tabId' });
+      return true;
+    }
+    sendSelectionTranslate(tabId, extra || {})
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 

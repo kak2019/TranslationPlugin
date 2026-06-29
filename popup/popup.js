@@ -32,6 +32,18 @@ async function getActiveTab() {
   return tab;
 }
 
+async function queryTranslatingState(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ action: 'queryTranslating', tabId }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response || { isTranslating: false, watchModeActive: false });
+    });
+  });
+}
+
 async function broadcastToContentScript(tabId, contentAction, extra = {}) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
@@ -47,15 +59,45 @@ async function broadcastToContentScript(tabId, contentAction, extra = {}) {
   });
 }
 
+async function sendSelectionTranslate(tabId, extra = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'selectionTranslate', tabId, extra },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+
+async function sendPageTranslate(tabId, extra = {}) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'pageTranslate', tabId, extra },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      }
+    );
+  });
+}
+
 async function sendToContentScript(tabId, action, extra = {}) {
   try {
-    return await chrome.tabs.sendMessage(tabId, { action, ...extra });
+    return await chrome.tabs.sendMessage(tabId, { action, ...extra }, { frameId: 0 });
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       files: ['content/content.js']
     });
-    return chrome.tabs.sendMessage(tabId, { action, ...extra });
+    return chrome.tabs.sendMessage(tabId, { action, ...extra }, { frameId: 0 });
   }
 }
 
@@ -109,7 +151,7 @@ async function init() {
   const tab = await getActiveTab();
   if (tab?.id) {
     try {
-      const state = await sendToContentScript(tab.id, 'getTranslating');
+      const state = await queryTranslatingState(tab.id);
       if (state?.isTranslating) {
         setTranslating(true);
         showStatus('Arya 正在翻译…', 'info');
@@ -146,9 +188,11 @@ async function runTranslation(action) {
       model: modelSelect.value
     });
 
-    const result = await sendToContentScript(tab.id, action, {
-      useCached: action === 'translateSelection'
-    });
+    const result = action === 'translate'
+      ? await sendPageTranslate(tab.id)
+      : await sendSelectionTranslate(tab.id, {
+          useCached: action === 'translateSelection'
+        });
 
     if (result?.cancelled) {
       showStatus('Arya 已停止，下次见 👋', 'info');
