@@ -15,6 +15,7 @@ const regionSelect = document.getElementById('region');
 const modelSelect = document.getElementById('modelSelect');
 const batchSizeSelect = document.getElementById('batchSize');
 const concurrencySelect = document.getElementById('concurrency');
+const autoTranslateInput = document.getElementById('autoTranslate');
 const saveBtn = document.getElementById('saveBtn');
 const saveStatus = document.getElementById('saveStatus');
 const donateQrImg = document.getElementById('donateQr');
@@ -66,7 +67,8 @@ async function loadSettings() {
     xiaomiApiKey: '',
     model: 'qwen-mt-flash',
     batchSize: 40,
-    concurrency: 4
+    concurrency: 4,
+    autoTranslate: false
   });
 
   apiKeyInput.value = stored.apiKey;
@@ -77,6 +79,7 @@ async function loadSettings() {
   regionSelect.value = urlToRegion(stored.baseUrl);
   batchSizeSelect.value = String(stored.batchSize);
   concurrencySelect.value = String(stored.concurrency);
+  autoTranslateInput.checked = Boolean(stored.autoTranslate);
 }
 
 saveBtn.addEventListener('click', async () => {
@@ -88,6 +91,7 @@ saveBtn.addEventListener('click', async () => {
   const baseUrl = REGION_URLS[regionSelect.value];
   const batchSize = Number(batchSizeSelect.value);
   const concurrency = Number(concurrencySelect.value);
+  const autoTranslate = autoTranslateInput.checked;
 
   await chrome.storage.sync.set({
     apiKey,
@@ -97,7 +101,8 @@ saveBtn.addEventListener('click', async () => {
     xiaomiApiKey,
     model,
     batchSize,
-    concurrency
+    concurrency,
+    autoTranslate
   });
 
   saveStatus.textContent = '已保存';

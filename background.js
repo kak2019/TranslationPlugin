@@ -40,7 +40,8 @@ const DEFAULT_CONFIG = {
   model: 'qwen-mt-flash',
   targetLang: '简体中文',
   batchSize: 40,
-  concurrency: 4
+  concurrency: 4,
+  autoTranslate: false
 };
 
 const MT_MAX_CONCURRENT = 4;
@@ -994,6 +995,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           modelName: getModelName(config.model),
           batchSize: config.batchSize,
           concurrency: config.concurrency,
+          autoTranslate: Boolean(config.autoTranslate),
           hasApiKey: canTranslate,
           usingHostedKey: canTranslate && isUsingHostedBailianKey(config),
           afdianPageUrl: getAfdianPageUrl()

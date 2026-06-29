@@ -10,6 +10,7 @@ const modelSubtitle = document.getElementById('modelSubtitle');
 const paymentBanner = document.getElementById('paymentBanner');
 const paymentBannerText = document.getElementById('paymentBannerText');
 const upgradeBtn = document.getElementById('upgradeBtn');
+const autoTranslateToggle = document.getElementById('autoTranslateToggle');
 
 function showStatus(message, type = 'info') {
   statusEl.textContent = message;
@@ -128,11 +129,13 @@ function updateAccessHint(config, modelId) {
 async function init() {
   const stored = await chrome.storage.sync.get({
     targetLang: '简体中文',
-    model: 'qwen-mt-flash'
+    model: 'qwen-mt-flash',
+    autoTranslate: false
   });
 
   populateModelSelect(modelSelect, stored.model);
   targetLangSelect.value = stored.targetLang;
+  autoTranslateToggle.checked = Boolean(stored.autoTranslate);
   updateModelHint(stored.model);
 
   chrome.runtime.sendMessage({ action: 'getConfig' }, (response) => {
@@ -169,6 +172,10 @@ modelSelect.addEventListener('change', () => {
 
 targetLangSelect.addEventListener('change', () => {
   chrome.storage.sync.set({ targetLang: targetLangSelect.value });
+});
+
+autoTranslateToggle.addEventListener('change', () => {
+  chrome.storage.sync.set({ autoTranslate: autoTranslateToggle.checked });
 });
 
 async function runTranslation(action) {

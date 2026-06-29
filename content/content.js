@@ -138,6 +138,97 @@
     return `Detected: ${sourceLang} → ${targetLang}`;
   }
 
+  function pageLangMatchesTarget(sourceLang, targetLang) {
+    if (!sourceLang || sourceLang === '未知' || sourceLang === '混合') return false;
+
+    const target = targetLang.toLowerCase();
+    if (sourceLang === '中文') {
+      return target.includes('中文') || target.includes('chinese');
+    }
+    if (sourceLang === 'English') return target === 'english';
+    if (sourceLang === '日本語') return target.includes('日本');
+    if (sourceLang === '한국어') return target.includes('한국') || target.includes('korean');
+    if (sourceLang === 'Русский') return target.includes('рус') || target.includes('russian');
+    return false;
+  }
+
+  const AUTO_TRANSLATE_DELAY_MS = 1500;
+  const AUTO_SKIP_SESSION_KEY = 'arya-auto-skip-url';
+  const AUTO_DONE_SESSION_KEY = 'arya-auto-done-url';
+  let autoTranslateTimer = null;
+
+  function markAutoTranslateSkippedForPage() {
+    try { sessionStorage.setItem(AUTO_SKIP_SESSION_KEY, location.href); } catch { /* ignore */ }
+  }
+
+  function wasAutoTranslateSkippedForPage() {
+    try { return sessionStorage.getItem(AUTO_SKIP_SESSION_KEY) === location.href; } catch { return false; }
+  }
+
+  function markAutoTranslateDoneForPage() {
+    try { sessionStorage.setItem(AUTO_DONE_SESSION_KEY, location.href); } catch { /* ignore */ }
+  }
+
+  function wasAutoTranslateDoneForPage() {
+    try { return sessionStorage.getItem(AUTO_DONE_SESSION_KEY) === location.href; } catch { return false; }
+  }
+
+  function isRestrictedPageUrl() {
+    const url = location.href;
+    return url.startsWith('chrome://') || url.startsWith('edge://')
+      || url.startsWith('chrome-extension://') || url.startsWith('moz-extension://')
+      || url.startsWith('about:');
+  }
+
+  function hasTranslationAccess() {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ action: 'getConfig' }, (response) => {
+        resolve(Boolean(response?.config?.hasApiKey));
+      });
+    });
+  }
+
+  async function maybeAutoTranslate() {
+    if (!shouldHandlePageTranslate()) return;
+    if (isRestrictedPageUrl()) return;
+    if (isTranslating || isProcessingIncremental || watchModeActive) return;
+    if (wasAutoTranslateSkippedForPage() || wasAutoTranslateDoneForPage()) return;
+
+    const settings = await getSettings();
+    if (!settings.autoTranslate) return;
+
+    const canTranslate = await hasTranslationAccess();
+    if (!canTranslate) return;
+
+    const scannedNodes = await collectTextNodesAsync(() => {}, null);
+    const detected = detectPageLanguage(scannedNodes);
+    if (pageLangMatchesTarget(detected, settings.targetLang)) {
+      markAutoTranslateDoneForPage();
+      return;
+    }
+
+    const textNodes = scannedNodes.filter((node) => {
+      const text = node.textContent.trim();
+      return !likelyAlreadyTargetLanguage(text, settings.targetLang);
+    });
+    const attrItems = await collectAttrItemsAsync(settings.targetLang);
+    if (!textNodes.length && !attrItems.length) {
+      markAutoTranslateDoneForPage();
+      return;
+    }
+
+    markAutoTranslateDoneForPage();
+    await translatePage();
+  }
+
+  function scheduleAutoTranslate() {
+    if (autoTranslateTimer) clearTimeout(autoTranslateTimer);
+    autoTranslateTimer = setTimeout(() => {
+      autoTranslateTimer = null;
+      maybeAutoTranslate();
+    }, AUTO_TRANSLATE_DELAY_MS);
+  }
+
   function updateCachedSelection() {
     const sel = window.getSelection();
     if (!sel?.rangeCount || sel.isCollapsed) {
@@ -709,13 +800,20 @@
   function getSettings() {
     return new Promise((resolve) => {
       chrome.storage.sync.get(
-        { batchSize: 40, concurrency: 4, model: 'qwen-mt-flash', targetLang: '简体中文' },
+        {
+          batchSize: 40,
+          concurrency: 4,
+          model: 'qwen-mt-flash',
+          targetLang: '简体中文',
+          autoTranslate: false
+        },
         (stored) => {
           const isMt = stored.model?.trim().toLowerCase().startsWith('qwen-mt');
           resolve({
             batchSize: Number(stored.batchSize) || 40,
             concurrency: Number(stored.concurrency) || 4,
             targetLang: stored.targetLang || '简体中文',
+            autoTranslate: Boolean(stored.autoTranslate),
             isMt
           });
         }
@@ -980,6 +1078,7 @@
   function restoreOriginal() {
     stopWatchMode();
     hideSelectionBubble();
+    markAutoTranslateSkippedForPage();
     sessionId = null;
     resetSessionUsage();
     isApplyingTranslation = true;
@@ -1595,5 +1694,19 @@
       return true;
     }
     return false;
+  });
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleAutoTranslate, { once: true });
+  } else {
+    scheduleAutoTranslate();
+  }
+
+  window.addEventListener('popstate', scheduleAutoTranslate);
+  window.addEventListener('hashchange', scheduleAutoTranslate);
+
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'sync' || !changes.autoTranslate?.newValue) return;
+    scheduleAutoTranslate();
   });
 })();

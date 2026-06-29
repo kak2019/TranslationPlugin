@@ -87,6 +87,17 @@
     .plan-actions button.secondary {
       background: #fff; color: #6366f1; border: 1px solid #c7d2fe;
     }
+    .toggle-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 12px 14px; background: #f8f9fc; border-radius: 8px;
+      border: 1px solid #e5e7eb;
+    }
+    .toggle-row input[type="checkbox"] {
+      width: auto; margin-top: 3px; accent-color: #6366f1;
+    }
+    .toggle-row label.toggle-text {
+      font-weight: 600; margin-bottom: 0; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -161,6 +172,22 @@
     </div>
 
     <div class="card">
+      <h2>翻译行为</h2>
+      <div class="field">
+        <div class="toggle-row">
+          <input type="checkbox" id="autoTranslate">
+          <div>
+            <label class="toggle-text" for="autoTranslate">打开页面时自动翻译</label>
+            <p class="hint" style="margin-top:6px">
+              检测到页面语言与目标语言不同时，延迟约 1.5 秒后自动开始整页翻译。
+              点击「恢复原文」后，当前页面在本标签内不再自动翻译。
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>速度优化</h2>
       <div class="speed-box">
         Qwen-MT 自动合并（每批最多 5800 字）、去重、本地缓存、流式渐进显示；并行默认 4；自适应 RPM 限速。备用 Key 需不同主账号。<br>
@@ -210,7 +237,7 @@
       Arya 以我女朋友的名字命名。❤️<br>
       希望它帮你更好地阅读这个世界。
     </p>
-    <p class="arya-version-note">v2.2.1 — 划词气泡、iframe 优化、多 frame 恢复取消、跳过目标语言。</p>
+    <p class="arya-version-note">v2.2.2 — 自动翻译开关、划词气泡、iframe 优化、跳过目标语言。</p>
   </div>
   <script src="../shared/models.js"></script>
   <script src="../shared/afdian.js"></script>
