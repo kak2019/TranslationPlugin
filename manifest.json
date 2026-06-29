@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Arya Translate - AI Web Translator",
   "version": "2.2.0",
-  "description": "Free AI web translator powered by Qwen-MT. Bridging languages, inspired by love.",
+  "description": "免费 AI 网页翻译，支持 Qwen-MT 开箱即用。以爱连接每一种语言。",
   "permissions": [
     "storage",
     "activeTab",
@@ -42,21 +42,21 @@
         "default": "Ctrl+Shift+Y",
         "mac": "Command+Shift+Y"
       },
-      "description": "Translate this page"
+      "description": "翻译当前页面"
     },
     "translate-selection": {
       "suggested_key": {
         "default": "Ctrl+Shift+E",
         "mac": "Command+Shift+E"
       },
-      "description": "Translate selected text"
+      "description": "翻译选中文本"
     },
     "restore-page": {
       "suggested_key": {
         "default": "Ctrl+Shift+U",
         "mac": "Command+Shift+U"
       },
-      "description": "Restore original text"
+      "description": "恢复原文"
     }
   },
   "content_scripts": [

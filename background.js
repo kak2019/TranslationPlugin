@@ -705,9 +705,31 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   return results;
 }
 
+function computeBatchUsage(texts) {
+  const inputChars = texts.reduce((sum, t) => sum + (t?.length || 0), 0);
+  return {
+    inputChars,
+    estimatedTokens: Math.ceil(inputChars / 3.5)
+  };
+}
+
 async function translateBatch(texts, requestId, streamCallback = null) {
   const config = await getConfig();
-  return translateTextsReliable(texts, config, requestId, streamCallback);
+  const translations = await translateTextsReliable(texts, config, requestId, streamCallback);
+  return { translations, usage: computeBatchUsage(texts) };
+}
+
+async function sendToContentScript(tabId, action, extra = {}) {
+  const payload = { action, ...extra };
+  try {
+    return await chrome.tabs.sendMessage(tabId, payload);
+  } catch {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ['content/content.js']
+    });
+    return chrome.tabs.sendMessage(tabId, payload);
+  }
 }
 
 function cancelSession(sessionId) {
@@ -719,56 +741,36 @@ function cancelSession(sessionId) {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: 'arya-translate-page',
-    title: 'Arya: Translate this page',
+    title: 'Arya：翻译此页面',
     contexts: ['page']
   });
   chrome.contextMenus.create({
     id: 'arya-translate-selection',
-    title: 'Arya: Translate selection',
+    title: 'Arya：翻译选中文本',
     contexts: ['selection']
   });
 });
 
-async function injectContentScripts(tabId) {
-  await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    files: ['content/content.js']
-  });
-}
-
-async function sendToTab(tabId, action, extra = {}) {
-  try {
-    return await chrome.tabs.sendMessage(tabId, { action, ...extra });
-  } catch {
-    await injectContentScripts(tabId);
-    return chrome.tabs.sendMessage(tabId, { action, ...extra });
-  }
-}
-
-chrome.commands.onCommand.addListener(async (command) => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) return;
-  if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return;
-
-  const actionMap = {
-    'translate-page': 'translate',
-    'translate-selection': 'translateSelection',
-    'restore-page': 'restore'
-  };
-  const action = actionMap[command];
-  if (action) await sendToTab(tab.id, action);
-});
-
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
-
   if (info.menuItemId === 'arya-translate-page') {
-    await sendToTab(tab.id, 'translate');
-    return;
+    await sendToContentScript(tab.id, 'translate');
+  } else if (info.menuItemId === 'arya-translate-selection') {
+    await sendToContentScript(tab.id, 'translateSelection', {
+      selectionText: info.selectionText || ''
+    });
   }
+});
 
-  if (info.menuItemId === 'arya-translate-selection') {
-    await sendToTab(tab.id, 'translateSelection', { selectionText: info.selectionText || '' });
+chrome.commands.onCommand.addListener(async (command, tab) => {
+  if (!tab?.id) return;
+  if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return;
+  if (command === 'translate-page') {
+    await sendToContentScript(tab.id, 'translate');
+  } else if (command === 'translate-selection') {
+    await sendToContentScript(tab.id, 'translateSelection');
+  } else if (command === 'restore-page') {
+    await sendToContentScript(tab.id, 'restore');
   }
 });
 
@@ -780,7 +782,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === 'translateBatch') {
     translateBatch(message.texts, message.requestId)
-      .then((translations) => sendResponse({ success: true, translations }))
+      .then(({ translations, usage }) => sendResponse({ success: true, translations, usage }))
       .catch((error) => {
         const cancelled = error.name === 'AbortError';
         sendResponse({
@@ -839,7 +841,7 @@ chrome.runtime.onConnect.addListener((port) => {
     translateBatch(message.texts, message.requestId, (segments) => {
       port.postMessage({ type: 'partial', segments });
     })
-      .then((translations) => port.postMessage({ type: 'done', translations }))
+      .then(({ translations, usage }) => port.postMessage({ type: 'done', translations, usage }))
       .catch((error) => {
         port.postMessage({
           type: 'error',
