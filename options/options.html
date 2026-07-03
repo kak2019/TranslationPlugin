@@ -28,7 +28,7 @@
     input:focus, select:focus {
       border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.15);
     }
-    .actions { display: flex; gap: 12px; align-items: center; margin-top: 24px; }
+    .actions { display: flex; gap: 12px; align-items: center; margin-top: 24px; margin-bottom: 32px; }
     button {
       padding: 10px 24px; background: linear-gradient(135deg, #6366f1, #8b5cf6);
       color: #fff; border: none; border-radius: 8px; font-size: 14px;
@@ -61,19 +61,25 @@
       display: block; width: 180px; height: 180px; object-fit: contain;
       border-radius: 6px;
     }
-    .support-note { font-size: 12px; color: #999; line-height: 1.5; }
+    .support-note { font-size: 13px; color: #6b7280; line-height: 1.5; }
     .support-error {
       display: none; font-size: 12px; color: #b45309;
       background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px;
       padding: 10px 12px; margin-top: 8px; line-height: 1.5;
     }
+    .arya-footer {
+      margin-top: 28px;
+      padding-top: 20px;
+      border-top: 1px solid #e5e7eb;
+      text-align: center;
+    }
     .arya-easter-egg {
-      font-size: 11px; color: #d1d5db; text-align: center;
-      margin-top: 28px; line-height: 1.8; user-select: none;
+      font-size: 13px; color: #6b7280; text-align: center;
+      line-height: 1.8;
     }
     .arya-version-note {
-      font-size: 10px; color: #e5e7eb; text-align: center;
-      margin-top: 4px; margin-bottom: 20px; font-style: italic;
+      font-size: 12px; color: #9ca3af; text-align: center;
+      margin-top: 8px; margin-bottom: 20px; line-height: 1.5;
     }
     .plan-box {
       background: #f5f3ff; border: 1px solid #ddd6fe; border-radius: 8px;
@@ -233,11 +239,13 @@
       <p id="donateQrError" class="support-error"></p>
     </div>
 
-    <p class="arya-easter-egg">
-      Arya 以我女朋友的名字命名。❤️<br>
-      希望它帮你更好地阅读这个世界。
-    </p>
-    <p class="arya-version-note">v2.2.2 — 自动翻译开关、划词气泡、iframe 优化、跳过目标语言。</p>
+    <div class="arya-footer">
+      <p class="arya-easter-egg">
+        Arya 以我女朋友的名字命名。❤️<br>
+        希望它帮你更好地阅读这个世界。
+      </p>
+      <p class="arya-version-note">v2.2.2 — 自动翻译开关、划词气泡、iframe 优化、跳过目标语言。</p>
+    </div>
   </div>
   <script src="../shared/models.js"></script>
   <script src="../shared/afdian.js"></script>

@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "pack": "node scripts/pack.mjs",
+    "icons": "node scripts/gen-icons.mjs"
+  },
   "devDependencies": {
     "jimp": "^1.6.1"
   }
