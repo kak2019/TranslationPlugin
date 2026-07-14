@@ -25,8 +25,12 @@
   const translatedNodes = new WeakMap();
   const translatedAttrs = new WeakMap();
   const MUTATION_DEBOUNCE_MS = 350;
+  const NOISE_WINDOW_MS = 3000;
+  const NOISE_HIT_THRESHOLD = 3;
+  const NOISE_MUTE_MS = 8000;
   const SKIP_ANCESTOR_CLASSES = new Set(['sr-only', 'visually-hidden', 'notranslate']);
   const isTopFrame = window === window.top;
+  const noisyParents = new WeakMap();
 
   function isCrossOriginSubframe() {
     if (isTopFrame) return false;
@@ -59,6 +63,9 @@
   let currentLangHint = '';
   let selectionBubbleEl = null;
   let selectionBubbleRaf = null;
+  let originalTooltipEl = null;
+  let originalTooltipRaf = null;
+  let lastTooltipNode = null;
 
   function escapeHtml(text) {
     return String(text)
@@ -76,12 +83,52 @@
     return { cjk, kana, hangul, latin, cyrillic, total: text.length };
   }
 
+  function textSkeleton(text) {
+    return String(text).replace(/\d+/g, '#').replace(/\s+/g, ' ').trim();
+  }
+
+  function isDigitSkeletonChange(oldText, newText) {
+    if (oldText == null || newText == null) return false;
+    const a = String(oldText).trim();
+    const b = String(newText).trim();
+    if (!a || !b) return false;
+    if (!/\d/.test(a) && !/\d/.test(b)) return false;
+    return textSkeleton(a) === textSkeleton(b);
+  }
+
   function isLikelyNonTranslatable(text) {
     const t = text.trim();
     if (t.length < 2) return true;
     if (/^https?:\/\/\S+$/i.test(t)) return true;
     if (/^[\d\s.,:+\-/()%#]+$/.test(t)) return true;
+    // 验证码倒计时短文案（避免误伤普通「验证码」说明）
+    if (/^\d+\s*[秒sS]([后內内])?$/.test(t)) return true;
+    if (t.length <= 30 && /^\d+\s*[秒sS]后/.test(t)) return true;
+    if (t.length <= 24 && /^(重新(获取|发送)|再次发送|重发)/.test(t) && /\d/.test(t)) return true;
+    if (t.length <= 28 && /^(resend|retry|send again)/i.test(t) && /\d/.test(t)) return true;
+    if (t.length <= 20 && /^\d+\s*s\b/i.test(t)) return true;
+    if (t.length <= 24 && /(重新(获取|发送)|重发)\s*[（(]\d+[）)]/.test(t)) return true;
     return false;
+  }
+
+  function isNoisyParent(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const info = noisyParents.get(el);
+    return Boolean(info && Date.now() < info.mutedUntil);
+  }
+
+  function noteNoisyParent(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
+    const now = Date.now();
+    let info = noisyParents.get(el);
+    if (!info || now - info.windowStart > NOISE_WINDOW_MS) {
+      info = { windowStart: now, hits: 0, mutedUntil: 0 };
+    }
+    info.hits += 1;
+    if (info.hits >= NOISE_HIT_THRESHOLD) {
+      info.mutedUntil = now + NOISE_MUTE_MS;
+    }
+    noisyParents.set(el, info);
   }
 
   function likelyAlreadyTargetLanguage(text, targetLang) {
@@ -266,6 +313,86 @@
     }
   }
 
+  function hideOriginalTooltip() {
+    lastTooltipNode = null;
+    if (originalTooltipRaf) {
+      cancelAnimationFrame(originalTooltipRaf);
+      originalTooltipRaf = null;
+    }
+    if (originalTooltipEl) {
+      originalTooltipEl.style.display = 'none';
+    }
+  }
+
+  function ensureOriginalTooltip() {
+    ensureOverlayStyles();
+    if (originalTooltipEl) return originalTooltipEl;
+    const tip = document.createElement('div');
+    tip.id = 'arya-original-tooltip';
+    tip.setAttribute('translate', 'no');
+    document.documentElement.appendChild(tip);
+    originalTooltipEl = tip;
+    return tip;
+  }
+
+  function positionOriginalTooltip(tip, x, y) {
+    const pad = 12;
+    tip.style.display = 'block';
+    const rect = tip.getBoundingClientRect();
+    let left = x + 14;
+    let top = y + 16;
+    if (left + rect.width > window.innerWidth - pad) left = x - rect.width - 10;
+    if (top + rect.height > window.innerHeight - pad) top = y - rect.height - 10;
+    tip.style.left = `${Math.max(pad, left)}px`;
+    tip.style.top = `${Math.max(pad, top)}px`;
+  }
+
+  function resolveTextNodeAtPoint(x, y) {
+    try {
+      if (document.caretRangeFromPoint) {
+        const range = document.caretRangeFromPoint(x, y);
+        const node = range?.startContainer;
+        return node?.nodeType === Node.TEXT_NODE ? node : null;
+      }
+      if (document.caretPositionFromPoint) {
+        const pos = document.caretPositionFromPoint(x, y);
+        const node = pos?.offsetNode;
+        return node?.nodeType === Node.TEXT_NODE ? node : null;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  function onOriginalTooltipMove(e) {
+    if (originalTooltipRaf) return;
+    const { clientX, clientY, target } = e;
+    originalTooltipRaf = requestAnimationFrame(() => {
+      originalTooltipRaf = null;
+      if (isOurOverlayElement(target)) {
+        hideOriginalTooltip();
+        return;
+      }
+      const node = resolveTextNodeAtPoint(clientX, clientY);
+      if (!node || !translatedNodes.has(node)) {
+        if (lastTooltipNode) hideOriginalTooltip();
+        return;
+      }
+      const original = translatedNodes.get(node);
+      if (original == null || !String(original).trim() || original === node.textContent) {
+        hideOriginalTooltip();
+        return;
+      }
+      const tip = ensureOriginalTooltip();
+      if (lastTooltipNode !== node) {
+        tip.textContent = original;
+        lastTooltipNode = node;
+      }
+      positionOriginalTooltip(tip, clientX, clientY);
+    });
+  }
+
   function isSelectionInEditableContext(range) {
     let node = range.commonAncestorContainer;
     if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
@@ -358,6 +485,8 @@
   document.addEventListener('mouseup', updateCachedSelection, true);
   document.addEventListener('keyup', updateCachedSelection, true);
   document.addEventListener('scroll', hideSelectionBubble, true);
+  document.addEventListener('mousemove', onOriginalTooltipMove, true);
+  document.addEventListener('scroll', hideOriginalTooltip, true);
   document.addEventListener('mousedown', (e) => {
     if (!isOurBubbleElement(e.target)) hideSelectionBubble();
   }, true);
@@ -379,7 +508,9 @@
 
   function isOurOverlayElement(el) {
     return el?.id === 'bailian-translate-overlay' || el?.id === 'bailian-translate-styles'
+      || el?.id === 'arya-original-tooltip'
       || Boolean(el?.closest?.('#bailian-translate-overlay'))
+      || Boolean(el?.closest?.('#arya-original-tooltip'))
       || isOurBubbleElement(el);
   }
 
@@ -695,6 +826,17 @@
         transform: scale(1.06);
         box-shadow: 0 6px 18px rgba(99,102,241,0.45);
       }
+      #arya-original-tooltip {
+        position: fixed; z-index: 2147483647;
+        max-width: min(360px, calc(100vw - 24px));
+        padding: 8px 10px; border-radius: 8px;
+        background: rgba(24, 24, 27, 0.92); color: #f4f4f5;
+        font-size: 12px; line-height: 1.45; font-weight: 500;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+        pointer-events: none; display: none;
+        white-space: pre-wrap; word-break: break-word;
+      }
     `;
     document.head.appendChild(style);
   }
@@ -827,6 +969,7 @@
 
     for (const node of textNodes) {
       const text = node.textContent.trim();
+      if (!text || isLikelyNonTranslatable(text)) continue;
       if (!textToNodes.has(text)) {
         textToNodes.set(text, []);
         uniqueTexts.push(text);
@@ -834,7 +977,11 @@
       textToNodes.get(text).push(node);
     }
 
-    return { uniqueTexts, textToNodes, totalNodes: textNodes.length };
+    return {
+      uniqueTexts,
+      textToNodes,
+      totalNodes: [...textToNodes.values()].reduce((n, arr) => n + arr.length, 0)
+    };
   }
 
   function buildUniqueAttrPlan(attrItems) {
@@ -1078,6 +1225,7 @@
   function restoreOriginal() {
     stopWatchMode();
     hideSelectionBubble();
+    hideOriginalTooltip();
     markAutoTranslateSkippedForPage();
     sessionId = null;
     resetSessionUsage();
@@ -1101,6 +1249,7 @@
   function cancelTranslation() {
     cancelRequested = true;
     hideSelectionBubble();
+    hideOriginalTooltip();
     const sid = sessionId;
     stopWatchMode();
     if (sid) {
@@ -1116,24 +1265,66 @@
 
     if (root.nodeType === Node.TEXT_NODE) {
       const text = root.textContent.trim();
-      if (text.length >= 2 && !shouldSkipNode(root)) nodes.push(root);
+      if (text.length >= 2
+        && !shouldSkipNode(root)
+        && !isLikelyNonTranslatable(text)
+        && !isNoisyParent(root.parentElement)) {
+        nodes.push(root);
+      }
       return nodes;
     }
 
     if (root.nodeType !== Node.ELEMENT_NODE || isOurOverlayElement(root)) return nodes;
+    if (isNoisyParent(root)) return nodes;
 
     collectTextNodesFromRootTree(root, nodes);
-    return nodes;
+    return nodes.filter((n) => {
+      const text = n.textContent?.trim() || '';
+      return !isLikelyNonTranslatable(text) && !isNoisyParent(n.parentElement);
+    });
   }
 
   function extractTextNodesFromMutations(records) {
     const nodes = new Set();
     for (const record of records) {
       if (record.type === 'characterData' && record.target?.nodeType === Node.TEXT_NODE) {
-        collectTextNodesFromRoot(record.target).forEach((n) => nodes.add(n));
+        const target = record.target;
+        const newText = target.textContent || '';
+        const oldText = record.oldValue || '';
+        if (isDigitSkeletonChange(oldText, newText)) {
+          noteNoisyParent(target.parentElement);
+          continue;
+        }
+        if (isLikelyNonTranslatable(newText.trim())) {
+          if (/\d/.test(newText) || /\d/.test(oldText)) {
+            noteNoisyParent(target.parentElement);
+          }
+          continue;
+        }
+        if (isNoisyParent(target.parentElement)) continue;
+        collectTextNodesFromRoot(target).forEach((n) => nodes.add(n));
       }
       for (const node of record.addedNodes || []) {
-        collectTextNodesFromRoot(node).forEach((n) => nodes.add(n));
+        const parent = node.parentElement
+          || (node.nodeType === Node.ELEMENT_NODE ? node : null);
+        if (parent && isNoisyParent(parent)) continue;
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.textContent || '';
+          if (isLikelyNonTranslatable(text.trim())) {
+            if (/\d/.test(text)) noteNoisyParent(node.parentElement);
+            continue;
+          }
+        } else if (node.nodeType === Node.ELEMENT_NODE && isNoisyParent(node)) {
+          continue;
+        }
+        const collected = collectTextNodesFromRoot(node);
+        if (!collected.length && node.nodeType === Node.ELEMENT_NODE) {
+          const sample = (node.textContent || '').trim().slice(0, 40);
+          if (sample && isLikelyNonTranslatable(sample) && /\d/.test(sample)) {
+            noteNoisyParent(node.parentElement || node);
+          }
+        }
+        collected.forEach((n) => nodes.add(n));
       }
     }
     return [...nodes];
@@ -1280,8 +1471,16 @@
     if (!watchModeActive || isProcessingIncremental || isTranslating || cancelRequested) return;
     if (!pendingIncrementalNodes.size || !activeSettings) return;
 
-    const nodes = [...pendingIncrementalNodes];
+    const nodes = [...pendingIncrementalNodes].filter((n) => {
+      if (!n?.isConnected) return false;
+      if (shouldSkipNode(n)) return false;
+      if (isNoisyParent(n.parentElement)) return false;
+      const text = n.textContent?.trim() || '';
+      return text.length >= 2 && !isLikelyNonTranslatable(text);
+    });
     pendingIncrementalNodes.clear();
+    if (!nodes.length) return;
+
     isProcessingIncremental = true;
 
     try {
@@ -1357,7 +1556,8 @@
     domObserver.observe(document.documentElement, {
       childList: true,
       subtree: true,
-      characterData: true
+      characterData: true,
+      characterDataOldValue: true
     });
 
     const onSpaNav = () => {
