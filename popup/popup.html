@@ -9,33 +9,41 @@
 <body>
   <div class="container">
     <header>
-      <h1>Arya Translate</h1>
-      <p id="modelSubtitle" class="subtitle">AI 网页翻译</p>
+      <div class="brand-mark" aria-hidden="true">A</div>
+      <div class="brand-text">
+        <h1>Arya Translate</h1>
+        <p id="modelSubtitle" class="subtitle">AI 网页翻译</p>
+      </div>
     </header>
 
     <div id="status" class="status hidden"></div>
 
-    <div class="field">
-      <label for="modelSelect">翻译模型</label>
-      <select id="modelSelect"></select>
-    </div>
+    <div class="panel">
+      <div class="field">
+        <label for="modelSelect">翻译模型</label>
+        <select id="modelSelect"></select>
+      </div>
 
-    <div class="field">
-      <label for="targetLang">目标语言</label>
-      <select id="targetLang">
-        <option value="简体中文">简体中文</option>
-        <option value="繁体中文">繁体中文</option>
-        <option value="English">English</option>
-        <option value="日本語">日本語</option>
-        <option value="한국어">한국어</option>
-        <option value="Français">Français</option>
-        <option value="Deutsch">Deutsch</option>
-        <option value="Español">Español</option>
-      </select>
-    </div>
+      <div class="field">
+        <label for="targetLang">目标语言</label>
+        <select id="targetLang">
+          <option value="简体中文">简体中文</option>
+          <option value="繁体中文">繁体中文</option>
+          <option value="English">English</option>
+          <option value="日本語">日本語</option>
+          <option value="한국어">한국어</option>
+          <option value="Français">Français</option>
+          <option value="Deutsch">Deutsch</option>
+          <option value="Español">Español</option>
+        </select>
+      </div>
 
-    <div class="field auto-translate-field">
-      <label class="auto-translate-label">
+      <label class="toggle-card">
+        <input type="checkbox" id="bilingualToggle">
+        <span>双语对照（译文在下方）</span>
+      </label>
+
+      <label class="toggle-card">
         <input type="checkbox" id="autoTranslateToggle">
         <span>打开页面时自动翻译</span>
       </label>
@@ -48,7 +56,7 @@
       <button id="restoreBtn" class="btn secondary">恢复原文</button>
     </div>
 
-    <p class="speed-tip">免费 · Qwen-MT 无需 Key · 选中文字点「译」气泡 · Ctrl+Shift+E 划词</p>
+    <p class="speed-tip">右侧贴边悬浮球 · 选区粉点预览 · 输入框互译</p>
 
     <div id="paymentBanner" class="payment-banner hidden">
       <span id="paymentBannerText"></span>

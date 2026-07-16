@@ -41,7 +41,11 @@ const DEFAULT_CONFIG = {
   targetLang: '简体中文',
   batchSize: 40,
   concurrency: 4,
-  autoTranslate: false
+  autoTranslate: false,
+  showFloatBall: true,
+  showSelectionDot: true,
+  showInputTranslate: true,
+  bilingualMode: false
 };
 
 const MT_MAX_CONCURRENT = 4;
@@ -712,9 +716,13 @@ function computeBatchUsage(texts) {
   };
 }
 
-async function translateBatch(texts, requestId, streamCallback = null) {
+async function translateBatch(texts, requestId, streamCallback = null, overrides = {}) {
   const config = await getConfig();
-  const translations = await translateTextsReliable(texts, config, requestId, streamCallback);
+  const merged = {
+    ...config,
+    ...(overrides.targetLang ? { targetLang: overrides.targetLang } : {})
+  };
+  const translations = await translateTextsReliable(texts, merged, requestId, streamCallback);
   return { translations, usage: computeBatchUsage(texts) };
 }
 
@@ -919,23 +927,78 @@ function cancelAllActiveSessions() {
   }
 }
 
+function ensureContextMenus() {
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: 'arya-translate-page',
+      title: 'Arya：翻译此页面',
+      contexts: ['page', 'editable', 'frame']
+    });
+    chrome.contextMenus.create({
+      id: 'arya-translate-selection',
+      title: 'Arya：翻译选中文本',
+      contexts: ['selection']
+    });
+  });
+}
+
+async function queryPageTranslated(tabId) {
+  if (!tabId) return false;
+  try {
+    await ensureContentScripts(tabId);
+    const res = await chrome.tabs.sendMessage(
+      tabId,
+      { action: 'getPageTranslateState' },
+      { frameId: 0 }
+    );
+    return Boolean(res?.translated);
+  } catch {
+    return false;
+  }
+}
+
+async function syncPageContextMenu(tabId) {
+  const translated = await queryPageTranslated(tabId);
+  try {
+    await chrome.contextMenus.update('arya-translate-page', {
+      title: translated ? 'Arya：恢复原文' : 'Arya：翻译此页面'
+    });
+  } catch {
+    // 菜单尚未创建时忽略
+  }
+  return translated;
+}
+
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'arya-translate-page',
-    title: 'Arya：翻译此页面',
-    contexts: ['page']
-  });
-  chrome.contextMenus.create({
-    id: 'arya-translate-selection',
-    title: 'Arya：翻译选中文本',
-    contexts: ['selection']
-  });
+  ensureContextMenus();
 });
+
+chrome.runtime.onStartup?.addListener?.(() => {
+  ensureContextMenus();
+});
+
+if (chrome.contextMenus.onShown) {
+  chrome.contextMenus.onShown.addListener(async (_info, tab) => {
+    if (!tab?.id) return;
+    try {
+      await syncPageContextMenu(tab.id);
+      if (chrome.contextMenus.refresh) await chrome.contextMenus.refresh();
+    } catch {
+      // ignore
+    }
+  });
+}
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   if (info.menuItemId === 'arya-translate-page') {
-    await sendPageTranslate(tab.id);
+    const translated = await queryPageTranslated(tab.id);
+    if (translated) {
+      await broadcastToContentScript(tab.id, 'restore');
+    } else {
+      await sendPageTranslate(tab.id);
+    }
+    await syncPageContextMenu(tab.id);
   } else if (info.menuItemId === 'arya-translate-selection') {
     await sendSelectionTranslate(tab.id, {
       selectionText: info.selectionText || ''
@@ -962,7 +1025,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.action === 'translateBatch') {
-    translateBatch(message.texts, message.requestId)
+    translateBatch(message.texts, message.requestId, null, {
+      targetLang: message.targetLang
+    })
       .then(({ translations, usage }) => sendResponse({ success: true, translations, usage }))
       .catch((error) => {
         const cancelled = error.name === 'AbortError';
@@ -972,6 +1037,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           error: cancelled ? '请求已取消' : error.message
         });
       });
+    return true;
+  }
+
+  if (message.action === 'selfPageTranslate') {
+    const tabId = _sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ success: false, error: '无法识别当前标签页' });
+      return true;
+    }
+    sendPageTranslate(tabId)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'selfBroadcast') {
+    const tabId = _sender.tab?.id;
+    if (!tabId || !message.contentAction) {
+      sendResponse({ success: false, error: '缺少 tabId 或 contentAction' });
+      return true;
+    }
+    broadcastToContentScript(tabId, message.contentAction, message.extra || {})
+      .then((result) => sendResponse(result ?? { success: true }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 
@@ -1068,9 +1157,14 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onMessage.addListener((message) => {
     if (message.action !== 'translateBatch') return;
 
-    translateBatch(message.texts, message.requestId, (segments) => {
-      port.postMessage({ type: 'partial', segments });
-    })
+    translateBatch(
+      message.texts,
+      message.requestId,
+      (segments) => {
+        port.postMessage({ type: 'partial', segments });
+      },
+      { targetLang: message.targetLang }
+    )
       .then(({ translations, usage }) => port.postMessage({ type: 'done', translations, usage }))
       .catch((error) => {
         port.postMessage({

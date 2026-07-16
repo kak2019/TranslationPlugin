@@ -16,6 +16,10 @@ const modelSelect = document.getElementById('modelSelect');
 const batchSizeSelect = document.getElementById('batchSize');
 const concurrencySelect = document.getElementById('concurrency');
 const autoTranslateInput = document.getElementById('autoTranslate');
+const bilingualModeInput = document.getElementById('bilingualMode');
+const showFloatBallInput = document.getElementById('showFloatBall');
+const showSelectionDotInput = document.getElementById('showSelectionDot');
+const showInputTranslateInput = document.getElementById('showInputTranslate');
 const saveBtn = document.getElementById('saveBtn');
 const saveStatus = document.getElementById('saveStatus');
 const donateQrImg = document.getElementById('donateQr');
@@ -68,7 +72,11 @@ async function loadSettings() {
     model: 'qwen-mt-flash',
     batchSize: 40,
     concurrency: 4,
-    autoTranslate: false
+    autoTranslate: false,
+    showFloatBall: true,
+    showSelectionDot: true,
+    showInputTranslate: true,
+    bilingualMode: false
   });
 
   apiKeyInput.value = stored.apiKey;
@@ -80,6 +88,10 @@ async function loadSettings() {
   batchSizeSelect.value = String(stored.batchSize);
   concurrencySelect.value = String(stored.concurrency);
   autoTranslateInput.checked = Boolean(stored.autoTranslate);
+  bilingualModeInput.checked = Boolean(stored.bilingualMode);
+  showFloatBallInput.checked = stored.showFloatBall !== false;
+  showSelectionDotInput.checked = stored.showSelectionDot !== false;
+  showInputTranslateInput.checked = stored.showInputTranslate !== false;
 }
 
 saveBtn.addEventListener('click', async () => {
@@ -92,6 +104,10 @@ saveBtn.addEventListener('click', async () => {
   const batchSize = Number(batchSizeSelect.value);
   const concurrency = Number(concurrencySelect.value);
   const autoTranslate = autoTranslateInput.checked;
+  const bilingualMode = bilingualModeInput.checked;
+  const showFloatBall = showFloatBallInput.checked;
+  const showSelectionDot = showSelectionDotInput.checked;
+  const showInputTranslate = showInputTranslateInput.checked;
 
   await chrome.storage.sync.set({
     apiKey,
@@ -102,7 +118,11 @@ saveBtn.addEventListener('click', async () => {
     model,
     batchSize,
     concurrency,
-    autoTranslate
+    autoTranslate,
+    bilingualMode,
+    showFloatBall,
+    showSelectionDot,
+    showInputTranslate
   });
 
   saveStatus.textContent = '已保存';

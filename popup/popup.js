@@ -11,6 +11,7 @@ const paymentBanner = document.getElementById('paymentBanner');
 const paymentBannerText = document.getElementById('paymentBannerText');
 const upgradeBtn = document.getElementById('upgradeBtn');
 const autoTranslateToggle = document.getElementById('autoTranslateToggle');
+const bilingualToggle = document.getElementById('bilingualToggle');
 
 function showStatus(message, type = 'info') {
   statusEl.textContent = message;
@@ -130,12 +131,14 @@ async function init() {
   const stored = await chrome.storage.sync.get({
     targetLang: '简体中文',
     model: 'qwen-mt-flash',
-    autoTranslate: false
+    autoTranslate: false,
+    bilingualMode: false
   });
 
   populateModelSelect(modelSelect, stored.model);
   targetLangSelect.value = stored.targetLang;
   autoTranslateToggle.checked = Boolean(stored.autoTranslate);
+  if (bilingualToggle) bilingualToggle.checked = Boolean(stored.bilingualMode);
   updateModelHint(stored.model);
 
   chrome.runtime.sendMessage({ action: 'getConfig' }, (response) => {
@@ -178,6 +181,12 @@ autoTranslateToggle.addEventListener('change', () => {
   chrome.storage.sync.set({ autoTranslate: autoTranslateToggle.checked });
 });
 
+if (bilingualToggle) {
+  bilingualToggle.addEventListener('change', () => {
+    chrome.storage.sync.set({ bilingualMode: bilingualToggle.checked });
+  });
+}
+
 async function runTranslation(action) {
   setTranslating(true);
   showStatus('Arya 正在为你翻译… ✨', 'info');
@@ -192,7 +201,8 @@ async function runTranslation(action) {
 
     await chrome.storage.sync.set({
       targetLang: targetLangSelect.value,
-      model: modelSelect.value
+      model: modelSelect.value,
+      bilingualMode: Boolean(bilingualToggle?.checked)
     });
 
     const result = action === 'translate'

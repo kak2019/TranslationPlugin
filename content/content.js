@@ -63,9 +63,54 @@
   let currentLangHint = '';
   let selectionBubbleEl = null;
   let selectionBubbleRaf = null;
+  let selectionPanelEl = null;
+  let selectionPanelHideTimer = null;
+  let selectionPreviewToken = 0;
+  const selectionPreviewCache = new Map();
   let originalTooltipEl = null;
   let originalTooltipRaf = null;
   let lastTooltipNode = null;
+  let floatBallEl = null;
+  let floatBallExpanded = false;
+  let inputFabEl = null;
+  let inputFabTarget = null;
+  let inputFabHideTimer = null;
+  let uiFeatureFlags = {
+    showFloatBall: true,
+    showSelectionDot: true,
+    showInputTranslate: true,
+    bilingualMode: false
+  };
+  const bilingualElements = new WeakMap();
+  let pageTranslationActive = false;
+
+  function setPageTranslationActive(active) {
+    pageTranslationActive = Boolean(active);
+  }
+
+  function isPageTranslationActive() {
+    if (pageTranslationActive || watchModeActive) return true;
+    try {
+      return Boolean(document.querySelector('.arya-bilingual, [data-arya-bilingual="1"]'));
+    } catch {
+      return pageTranslationActive;
+    }
+  }
+
+  const TARGET_LANG_OPTIONS = [
+    '简体中文', '繁体中文', 'English', '日本語', '한국어', 'Français', 'Deutsch', 'Español'
+  ];
+
+  const SPEECH_LANG_MAP = {
+    '简体中文': 'zh-CN',
+    '繁体中文': 'zh-TW',
+    English: 'en-US',
+    日本語: 'ja-JP',
+    한국어: 'ko-KR',
+    Français: 'fr-FR',
+    Deutsch: 'de-DE',
+    Español: 'es-ES'
+  };
 
   function escapeHtml(text) {
     return String(text)
@@ -299,7 +344,22 @@
   }
 
   function isOurBubbleElement(el) {
-    return el?.id === 'arya-selection-bubble' || Boolean(el?.closest?.('#arya-selection-bubble'));
+    return Boolean(
+      el?.closest?.(
+        '#arya-selection-bubble, #arya-selection-panel, #arya-float-ball, #arya-input-fab'
+      )
+    );
+  }
+
+  function hideSelectionPanel() {
+    if (selectionPanelHideTimer) {
+      clearTimeout(selectionPanelHideTimer);
+      selectionPanelHideTimer = null;
+    }
+    if (selectionPanelEl) {
+      selectionPanelEl.remove();
+      selectionPanelEl = null;
+    }
   }
 
   function hideSelectionBubble() {
@@ -307,10 +367,65 @@
       cancelAnimationFrame(selectionBubbleRaf);
       selectionBubbleRaf = null;
     }
+    hideSelectionPanel();
     if (selectionBubbleEl) {
       selectionBubbleEl.remove();
       selectionBubbleEl = null;
     }
+  }
+
+  function guessSpeechLang(text, fallbackLang) {
+    const { cjk, kana, hangul, latin, cyrillic, total } = scriptCounts(text);
+    if (!total) return SPEECH_LANG_MAP[fallbackLang] || 'en-US';
+    if (kana / total > 0.08) return 'ja-JP';
+    if (hangul / total > 0.2) return 'ko-KR';
+    if (cjk / total > 0.35) return 'zh-CN';
+    if (cyrillic / total > 0.35) return 'ru-RU';
+    if (latin / total > 0.4) return 'en-US';
+    return SPEECH_LANG_MAP[fallbackLang] || 'en-US';
+  }
+
+  function speakText(text, langCode) {
+    if (!text || !window.speechSynthesis) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = langCode || 'en-US';
+      utter.rate = 1;
+      window.speechSynthesis.speak(utter);
+    } catch {
+      // 部分环境禁用语音合成
+    }
+  }
+
+  function translatePreviewTexts(texts, targetLang) {
+    const requestId = `preview-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        { action: 'translateBatch', texts, requestId, targetLang },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          if (!response?.success) {
+            reject(new Error(response?.error || '翻译失败'));
+            return;
+          }
+          resolve(response.translations || []);
+        }
+      );
+    });
+  }
+
+  function resolveMutualTargetLang(text, preferredTarget) {
+    const preferred = preferredTarget || '简体中文';
+    if (likelyAlreadyTargetLanguage(text, preferred)) {
+      if (preferred.includes('中文') || preferred.includes('chinese')) return 'English';
+      if (preferred === 'English') return '简体中文';
+      return '简体中文';
+    }
+    return preferred;
   }
 
   function hideOriginalTooltip() {
@@ -413,7 +528,132 @@
     });
   }
 
+  function positionSelectionPanel(panel, anchorRect) {
+    const pad = 8;
+    const panelW = Math.min(320, window.innerWidth - 24);
+    let left = anchorRect.right + 10;
+    let top = anchorRect.top - 4;
+    if (left + panelW > window.innerWidth - pad) {
+      left = Math.max(pad, anchorRect.left - panelW - 10);
+    }
+    panel.style.width = `${panelW}px`;
+    panel.style.left = `${left}px`;
+    panel.style.top = `${Math.min(Math.max(top, pad), window.innerHeight - 120)}px`;
+  }
+
+  function ensureSelectionPanel() {
+    if (selectionPanelEl) return selectionPanelEl;
+    ensureOverlayStyles();
+    const panel = document.createElement('div');
+    panel.id = 'arya-selection-panel';
+    panel.innerHTML = `
+      <div class="arya-sel-status">翻译中…</div>
+      <div class="arya-sel-text"></div>
+      <div class="arya-sel-actions">
+        <button type="button" class="arya-sel-btn" data-action="speak-src" title="朗读原文">🔊 原文</button>
+        <button type="button" class="arya-sel-btn" data-action="speak-dst" title="朗读译文">🔊 译文</button>
+        <button type="button" class="arya-sel-btn primary" data-action="apply" title="替换页面中的选中文本">译入页面</button>
+      </div>
+    `;
+    panel.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    panel.addEventListener('mouseenter', () => {
+      if (selectionPanelHideTimer) {
+        clearTimeout(selectionPanelHideTimer);
+        selectionPanelHideTimer = null;
+      }
+    });
+    panel.addEventListener('mouseleave', () => {
+      scheduleHideSelectionPanel();
+    });
+    document.documentElement.appendChild(panel);
+    selectionPanelEl = panel;
+    return panel;
+  }
+
+  function scheduleHideSelectionPanel() {
+    if (selectionPanelHideTimer) clearTimeout(selectionPanelHideTimer);
+    selectionPanelHideTimer = setTimeout(() => {
+      hideSelectionPanel();
+    }, 220);
+  }
+
+  async function showSelectionPreviewPanel(sourceText, anchorRect, allowApply) {
+    const settings = await getSettings();
+    const panel = ensureSelectionPanel();
+    const statusEl = panel.querySelector('.arya-sel-status');
+    const textEl = panel.querySelector('.arya-sel-text');
+    const applyBtn = panel.querySelector('[data-action="apply"]');
+    applyBtn.style.display = allowApply ? '' : 'none';
+    positionSelectionPanel(panel, anchorRect);
+    panel.style.display = 'block';
+
+    const cacheKey = `${settings.targetLang}::${sourceText}`;
+    const token = ++selectionPreviewToken;
+    let translation = selectionPreviewCache.get(cacheKey) || '';
+
+    statusEl.textContent = translation ? '译文' : '翻译中…';
+    textEl.textContent = translation || '';
+
+    const bindActions = (finalText) => {
+      panel.querySelector('[data-action="speak-src"]').onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        speakText(sourceText, guessSpeechLang(sourceText, settings.targetLang));
+      };
+      panel.querySelector('[data-action="speak-dst"]').onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!finalText) return;
+        speakText(finalText, SPEECH_LANG_MAP[settings.targetLang] || 'zh-CN');
+      };
+      applyBtn.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideSelectionBubble();
+        translateSelection().then((result) => {
+          if (result?.success) {
+            showOverlay(`完成！已翻译选中内容${formatUsageSuffix()}`, 100);
+            setTimeout(hideOverlay, 1800);
+          } else if (result?.error && !result?.cancelled) {
+            showOverlay(result.error, 0);
+            setTimeout(hideOverlay, 2200);
+          }
+        });
+      };
+    };
+
+    bindActions(translation);
+
+    if (translation) return;
+
+    try {
+      const [result] = await translatePreviewTexts([sourceText], settings.targetLang);
+      if (token !== selectionPreviewToken || !selectionPanelEl) return;
+      translation = (result || '').trim();
+      if (!translation) throw new Error('未返回译文');
+      selectionPreviewCache.set(cacheKey, translation);
+      if (selectionPreviewCache.size > 80) {
+        const first = selectionPreviewCache.keys().next().value;
+        selectionPreviewCache.delete(first);
+      }
+      statusEl.textContent = '译文';
+      textEl.textContent = translation;
+      bindActions(translation);
+    } catch (error) {
+      if (token !== selectionPreviewToken || !selectionPanelEl) return;
+      statusEl.textContent = '翻译失败';
+      textEl.textContent = error.message || '请稍后重试';
+    }
+  }
+
   function showSelectionBubble() {
+    if (!uiFeatureFlags.showSelectionDot) {
+      hideSelectionBubble();
+      return;
+    }
     if (isTranslating || isProcessingIncremental) return;
 
     const sel = window.getSelection();
@@ -429,12 +669,10 @@
     }
 
     let range;
+    let allowApply = true;
     try {
       range = sel.getRangeAt(0);
-      if (isSelectionInEditableContext(range)) {
-        hideSelectionBubble();
-        return;
-      }
+      allowApply = !isSelectionInEditableContext(range);
     } catch {
       hideSelectionBubble();
       return;
@@ -451,31 +689,35 @@
 
     const bubble = document.createElement('div');
     bubble.id = 'arya-selection-bubble';
-    bubble.innerHTML = '<button type="button" class="arya-bubble-btn" title="翻译选中文本">译</button>';
+    bubble.innerHTML = '<button type="button" class="arya-sel-dot" title="悬停查看译文" aria-label="翻译预览"></button>';
 
-    const left = Math.min(Math.max(rect.right + 8, 8), window.innerWidth - 44);
-    const top = Math.max(rect.top - 36, 8);
+    const left = Math.min(Math.max(rect.right + 6, 8), window.innerWidth - 22);
+    const top = Math.min(Math.max(rect.top + rect.height / 2 - 7, 8), window.innerHeight - 22);
     bubble.style.left = `${left}px`;
     bubble.style.top = `${top}px`;
 
-    bubble.querySelector('.arya-bubble-btn').addEventListener('mousedown', (e) => {
+    const dot = bubble.querySelector('.arya-sel-dot');
+    const openPanel = () => {
+      if (selectionPanelHideTimer) {
+        clearTimeout(selectionPanelHideTimer);
+        selectionPanelHideTimer = null;
+      }
+      const dotRect = dot.getBoundingClientRect();
+      showSelectionPreviewPanel(text, dotRect, allowApply);
+    };
+
+    dot.addEventListener('mousedown', (e) => {
       e.preventDefault();
       e.stopPropagation();
     });
-    bubble.querySelector('.arya-bubble-btn').addEventListener('click', (e) => {
+    dot.addEventListener('mouseenter', openPanel);
+    dot.addEventListener('mouseleave', () => {
+      scheduleHideSelectionPanel();
+    });
+    dot.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      hideSelectionBubble();
-      translateSelection().then((result) => {
-        if (result?.success) {
-          const usage = formatUsageSuffix();
-          showOverlay(`完成！已翻译选中内容${usage}`, 100);
-          setTimeout(hideOverlay, 1800);
-        } else if (result?.error && !result?.cancelled) {
-          showOverlay(result.error, 0);
-          setTimeout(hideOverlay, 2200);
-        }
-      });
+      openPanel();
     });
 
     document.documentElement.appendChild(bubble);
@@ -509,9 +751,52 @@
   function isOurOverlayElement(el) {
     return el?.id === 'bailian-translate-overlay' || el?.id === 'bailian-translate-styles'
       || el?.id === 'arya-original-tooltip'
+      || el?.id === 'arya-float-ball'
+      || el?.id === 'arya-input-fab'
+      || el?.id === 'arya-selection-panel'
+      || Boolean(el?.classList?.contains('arya-bilingual'))
       || Boolean(el?.closest?.('#bailian-translate-overlay'))
       || Boolean(el?.closest?.('#arya-original-tooltip'))
+      || Boolean(el?.closest?.('#arya-float-ball'))
+      || Boolean(el?.closest?.('#arya-input-fab'))
+      || Boolean(el?.closest?.('#arya-selection-panel'))
+      || Boolean(el?.closest?.('.arya-bilingual'))
       || isOurBubbleElement(el);
+  }
+
+  function isBilingualMode() {
+    if (activeSettings && typeof activeSettings.bilingualMode === 'boolean') {
+      return activeSettings.bilingualMode;
+    }
+    return Boolean(uiFeatureFlags.bilingualMode);
+  }
+
+  function findBilingualElement(node) {
+    const cached = bilingualElements.get(node);
+    if (cached?.isConnected) return cached;
+    let sib = node?.nextSibling;
+    while (sib) {
+      if (sib.nodeType === Node.ELEMENT_NODE && sib.classList?.contains('arya-bilingual')) {
+        bilingualElements.set(node, sib);
+        return sib;
+      }
+      if (sib.nodeType === Node.TEXT_NODE && sib.textContent.trim()) return null;
+      if (sib.nodeType === Node.ELEMENT_NODE) return null;
+      sib = sib.nextSibling;
+    }
+    return null;
+  }
+
+  function removeBilingualElement(node) {
+    const el = findBilingualElement(node);
+    if (!el) return;
+    isApplyingTranslation = true;
+    try {
+      el.remove();
+    } finally {
+      isApplyingTranslation = false;
+    }
+    bilingualElements.delete(node);
   }
 
   function shouldSkipElement(el) {
@@ -585,11 +870,22 @@
     while (elWalker.nextNode()) {
       const el = elWalker.currentNode;
       if (!shouldCollectAttrsFrom(el)) continue;
+      const visibleText = getHostVisibleText(el).toLowerCase();
       for (const attr of attrsForElement(el)) {
         const val = el.getAttribute(attr);
         if (!val || val.trim().length < 2) continue;
         if (isAttrAlreadyTranslated(el, attr)) continue;
         const text = val.trim();
+        // 与可见文案重复的 title/aria-label 不再单独翻译，避免同义双份
+        if (
+          (attr === 'title' || attr === 'aria-label')
+          && visibleText
+          && (visibleText === text.toLowerCase()
+            || visibleText.includes(text.toLowerCase())
+            || text.toLowerCase().includes(visibleText))
+        ) {
+          continue;
+        }
         if (targetLang && likelyAlreadyTargetLanguage(text, targetLang)) continue;
         items.push({ element: el, attr, text });
       }
@@ -607,6 +903,11 @@
 
   function shouldSkipNode(node) {
     if (translatedNodes.has(node)) return true;
+    if (findBilingualElement(node)) return true;
+    const host = findInteractiveHost(node);
+    if (host && bilingualElements.get(host)?.isConnected) return true;
+    const block = findTranslationBlock(node);
+    if (block && bilingualElements.get(block)?.isConnected) return true;
     let parent = node.parentElement;
     while (parent) {
       if (SKIP_TAGS.has(parent.tagName)) return true;
@@ -771,74 +1072,235 @@
   }
 
   function ensureOverlayStyles() {
-    if (document.getElementById('bailian-translate-styles')) return;
-    const style = document.createElement('style');
-    style.id = 'bailian-translate-styles';
+    const STYLE_VERSION = '8';
+    let style = document.getElementById('bailian-translate-styles');
+    if (style?.dataset?.version === STYLE_VERSION) return;
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'bailian-translate-styles';
+      document.head.appendChild(style);
+    }
+    style.dataset.version = STYLE_VERSION;
     style.textContent = `
       #bailian-translate-overlay {
-        position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        position: fixed; right: 18px; bottom: 18px; z-index: 2147483647;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
         pointer-events: none;
       }
       .bailian-overlay-card {
         pointer-events: auto;
-        background: rgba(255,255,255,0.97); border-radius: 12px; padding: 10px 14px;
-        min-width: 200px; max-width: 280px;
-        box-shadow: 0 6px 24px rgba(99,102,241,0.15), 0 1px 4px rgba(0,0,0,0.08);
-        border: 1px solid rgba(99,102,241,0.15);
+        background: rgba(255,255,255,0.98); border-radius: 16px; padding: 12px 14px;
+        min-width: 210px; max-width: 280px;
+        box-shadow: 0 10px 30px rgba(15,23,42,0.10), 0 1px 3px rgba(244,114,182,0.12);
+        border: 1px solid rgba(251, 207, 232, 0.7);
       }
       .bailian-overlay-header {
         display: flex; align-items: center; justify-content: space-between; gap: 8px;
         margin-bottom: 6px;
       }
       .bailian-overlay-title {
-        font-size: 13px; font-weight: 700; letter-spacing: 0.3px;
-        background: linear-gradient(135deg, #6366f1, #8b5cf6);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        background-clip: text;
+        font-size: 13px; font-weight: 700; letter-spacing: 0.2px; color: #e11d48;
       }
       .bailian-overlay-close {
-        border: none; background: none; color: #bbb; font-size: 16px; line-height: 1;
-        cursor: pointer; padding: 0 2px; transition: color 0.15s;
+        border: none; background: #fff1f2; color: #fb7185; width: 22px; height: 22px;
+        border-radius: 50%; font-size: 14px; line-height: 1; cursor: pointer;
       }
-      .bailian-overlay-close:hover { color: #dc2626; }
-      .bailian-overlay-message { font-size: 11px; color: #555; margin-bottom: 8px; line-height: 1.5; }
+      .bailian-overlay-close:hover { background: #ffe4e6; color: #e11d48; }
+      .bailian-overlay-message { font-size: 11px; color: #64748b; margin-bottom: 8px; line-height: 1.5; }
       .bailian-overlay-lang {
-        font-size: 10px; color: #6366f1; font-weight: 600; margin-bottom: 4px;
+        font-size: 10px; color: #f43f5e; font-weight: 600; margin-bottom: 4px;
       }
-      .bailian-overlay-status { font-size: 11px; color: #555; line-height: 1.5; }
-      .bailian-overlay-bar { height: 3px; background: #eee; border-radius: 2px; overflow: hidden; }
-      .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #8b5cf6); width: 0%; transition: width 0.3s; }
+      .bailian-overlay-status { font-size: 11px; color: #475569; line-height: 1.5; }
+      .bailian-overlay-bar { height: 3px; background: #ffe4e6; border-radius: 99px; overflow: hidden; }
+      .bailian-overlay-fill { height: 100%; background: linear-gradient(90deg, #fb7185, #f43f5e); width: 0%; transition: width 0.3s; }
       #arya-selection-bubble {
         position: fixed; z-index: 2147483646;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
         pointer-events: auto;
       }
-      #arya-selection-bubble .arya-bubble-btn {
-        border: none; cursor: pointer;
-        width: 32px; height: 32px; border-radius: 16px;
-        background: linear-gradient(135deg, #6366f1, #8b5cf6);
-        color: #fff; font-size: 13px; font-weight: 700;
-        box-shadow: 0 4px 14px rgba(99,102,241,0.35);
+      #arya-selection-bubble .arya-sel-dot {
+        border: none; cursor: pointer; padding: 0;
+        width: 12px; height: 12px; border-radius: 50%;
+        background: #f9a8b4;
+        box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(249,168,180,0.55);
         transition: transform 0.12s, box-shadow 0.12s;
       }
-      #arya-selection-bubble .arya-bubble-btn:hover {
-        transform: scale(1.06);
-        box-shadow: 0 6px 18px rgba(99,102,241,0.45);
+      #arya-selection-bubble .arya-sel-dot:hover {
+        transform: scale(1.2);
+        background: #f4729b;
+        box-shadow: 0 0 0 2px #fff, 0 3px 10px rgba(244,114,155,0.5);
+      }
+      #arya-selection-panel {
+        position: fixed; z-index: 2147483647; display: none;
+        background: #fff;
+        border: 1px solid #fce7f3;
+        border-radius: 14px; padding: 12px 14px;
+        box-shadow: 0 12px 32px rgba(15,23,42,0.12);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        color: #1f2937;
+      }
+      #arya-selection-panel .arya-sel-status {
+        font-size: 11px; color: #f43f5e; font-weight: 600; margin-bottom: 6px;
+      }
+      #arya-selection-panel .arya-sel-text {
+        font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+        max-height: 180px; overflow: auto; margin-bottom: 10px; min-height: 1.2em; color: #334155;
+      }
+      #arya-selection-panel .arya-sel-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+      #arya-selection-panel .arya-sel-btn {
+        border: 1px solid #f1f5f9; background: #f8fafc; color: #475569;
+        border-radius: 999px; padding: 5px 10px; font-size: 11px; cursor: pointer;
+      }
+      #arya-selection-panel .arya-sel-btn:hover { border-color: #fda4af; color: #e11d48; background: #fff1f2; }
+      #arya-selection-panel .arya-sel-btn.primary {
+        background: #f43f5e; border-color: transparent; color: #fff;
       }
       #arya-original-tooltip {
         position: fixed; z-index: 2147483647;
         max-width: min(360px, calc(100vw - 24px));
-        padding: 8px 10px; border-radius: 8px;
-        background: rgba(24, 24, 27, 0.92); color: #f4f4f5;
+        padding: 8px 10px; border-radius: 10px;
+        background: rgba(15, 23, 42, 0.92); color: #f8fafc;
         font-size: 12px; line-height: 1.45; font-weight: 500;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
-        box-shadow: 0 8px 24px rgba(0,0,0,0.22);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.2);
         pointer-events: none; display: none;
         white-space: pre-wrap; word-break: break-word;
       }
+      #arya-float-ball {
+        position: fixed; right: 0; top: 50%; transform: translateY(-50%);
+        z-index: 2147483645;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+        display: flex; flex-direction: row-reverse; align-items: center; gap: 10px;
+      }
+      #arya-float-ball .arya-fb-main {
+        display: flex; align-items: center; justify-content: center;
+        width: 46px; height: 44px; margin: 0; padding: 0 4px 0 8px;
+        border: 1px solid rgba(15,23,42,0.06); border-right: none;
+        border-radius: 22px 0 0 22px; cursor: pointer;
+        background: #fff;
+        box-shadow: -4px 2px 16px rgba(15,23,42,0.08);
+        transition: background 0.15s, box-shadow 0.15s;
+      }
+      #arya-float-ball .arya-fb-main:hover {
+        background: #fffafb;
+        box-shadow: -4px 2px 16px rgba(244,114,182,0.16);
+      }
+      #arya-float-ball .arya-fb-icon {
+        position: relative;
+        width: 30px; height: 30px; border-radius: 50%;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: linear-gradient(145deg, #fda4af 0%, #f4729b 55%, #fb7185 100%);
+        color: #fff; font-size: 13px; font-weight: 800; letter-spacing: -0.3px;
+        box-shadow: 0 2px 8px rgba(244,114,155,0.35);
+      }
+      #arya-float-ball .arya-fb-icon::before,
+      #arya-float-ball .arya-fb-icon::after {
+        position: absolute; color: #fff; line-height: 1; pointer-events: none;
+      }
+      #arya-float-ball .arya-fb-icon::before {
+        content: '✦'; top: 2px; left: 3px; font-size: 7px; opacity: 0.95;
+      }
+      #arya-float-ball .arya-fb-icon::after {
+        content: '✧'; bottom: 3px; right: 3px; font-size: 6px; opacity: 0.85;
+      }
+      #arya-float-ball .arya-fb-panel {
+        display: none; width: 216px; padding: 14px;
+        background: #fff; border-radius: 18px;
+        border: 1px solid #fce7f3;
+        box-shadow: 0 16px 40px rgba(15,23,42,0.12);
+      }
+      #arya-float-ball.expanded .arya-fb-panel { display: block; }
+      #arya-float-ball .arya-fb-title {
+        display: flex; align-items: center; gap: 8px;
+        font-size: 14px; font-weight: 700; color: #e11d48; margin-bottom: 12px;
+      }
+      #arya-float-ball .arya-fb-title-dot {
+        width: 18px; height: 18px; border-radius: 50%;
+        background: linear-gradient(145deg, #fda4af, #f4729b);
+        box-shadow: 0 1px 4px rgba(244,114,155,0.35);
+        flex-shrink: 0;
+      }
+      #arya-float-ball .arya-fb-label {
+        display: block; font-size: 11px; color: #94a3b8; margin-bottom: 6px; font-weight: 500;
+      }
+      #arya-float-ball select {
+        width: 100%; margin-bottom: 10px; padding: 9px 10px; border-radius: 12px;
+        border: 1px solid #f1f5f9; font-size: 13px; background: #f8fafc; color: #0f172a;
+        outline: none;
+      }
+      #arya-float-ball select:focus {
+        border-color: #fda4af; background: #fff; box-shadow: 0 0 0 3px rgba(253,164,175,0.25);
+      }
+      #arya-float-ball .arya-fb-actions { display: grid; gap: 8px; }
+      #arya-float-ball .arya-fb-btn {
+        border: none; border-radius: 12px; padding: 10px 12px; font-size: 13px;
+        font-weight: 650; cursor: pointer; transition: transform 0.1s, opacity 0.15s;
+      }
+      #arya-float-ball .arya-fb-btn:active { transform: scale(0.98); }
+      #arya-float-ball .arya-fb-btn.translate {
+        background: #f43f5e; color: #fff;
+        box-shadow: 0 6px 14px rgba(244,63,94,0.28);
+      }
+      #arya-float-ball .arya-fb-btn.translate:hover { background: #e11d48; }
+      #arya-float-ball .arya-fb-btn.restore {
+        background: #fff1f2; color: #be123c; border: 1px solid #fecdd3;
+      }
+      #arya-float-ball .arya-fb-btn.cancel { background: #fff; color: #dc2626; border: 1px solid #fecaca; display: none; }
+      #arya-float-ball.translating .arya-fb-btn.cancel { display: block; }
+      #arya-float-ball.translating .arya-fb-btn.translate { display: none; }
+      #arya-float-ball .arya-fb-toggle {
+        display: flex; align-items: center; gap: 8px;
+        margin: 0 0 12px; padding: 10px 12px; border-radius: 12px;
+        background: #fff1f2; border: 1px solid #ffe4e6;
+        cursor: pointer; user-select: none;
+      }
+      #arya-float-ball .arya-fb-toggle input {
+        width: 15px; height: 15px; accent-color: #f43f5e; cursor: pointer;
+      }
+      #arya-float-ball .arya-fb-toggle span {
+        font-size: 12px; font-weight: 600; color: #be123c;
+      }
+      .arya-bilingual {
+        color: inherit !important;
+        font-weight: inherit !important;
+        word-break: break-word !important;
+      }
+      .arya-bilingual.arya-bilingual-inline {
+        display: inline !important;
+        margin: 0 0 0 0.35em !important;
+        padding: 0 !important;
+        border-left: none !important;
+        opacity: 0.75 !important;
+        font-size: 0.9em !important;
+        line-height: inherit !important;
+        white-space: nowrap !important;
+        vertical-align: baseline !important;
+        font-weight: 500 !important;
+      }
+      .arya-bilingual.arya-bilingual-block {
+        display: block !important;
+        margin: 0.18em 0 0.5em !important;
+        padding: 0.1em 0 0.1em 0.7em !important;
+        border-left: 2.5px solid #c4b5fd !important;
+        opacity: 0.88 !important;
+        font-size: inherit !important;
+        line-height: 1.55 !important;
+        white-space: pre-wrap !important;
+      }
+      #arya-input-fab {
+        position: fixed; z-index: 2147483644; display: none;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+      }
+      #arya-input-fab button {
+        border: 1px solid #fecdd3; cursor: pointer; border-radius: 999px;
+        padding: 6px 12px; font-size: 11px; font-weight: 700;
+        color: #be123c; background: #fff;
+        box-shadow: 0 4px 12px rgba(244,114,182,0.18);
+        white-space: nowrap;
+      }
+      #arya-input-fab button:disabled { opacity: 0.65; cursor: wait; }
+      #arya-input-fab button:hover:not(:disabled) { background: #fff1f2; }
     `;
-    document.head.appendChild(style);
   }
 
   function showOverlay(message, progress, langHint) {
@@ -947,15 +1409,29 @@
           concurrency: 4,
           model: 'qwen-mt-flash',
           targetLang: '简体中文',
-          autoTranslate: false
+          autoTranslate: false,
+          showFloatBall: true,
+          showSelectionDot: true,
+          showInputTranslate: true,
+          bilingualMode: false
         },
         (stored) => {
           const isMt = stored.model?.trim().toLowerCase().startsWith('qwen-mt');
+          uiFeatureFlags = {
+            showFloatBall: stored.showFloatBall !== false,
+            showSelectionDot: stored.showSelectionDot !== false,
+            showInputTranslate: stored.showInputTranslate !== false,
+            bilingualMode: Boolean(stored.bilingualMode)
+          };
           resolve({
             batchSize: Number(stored.batchSize) || 40,
             concurrency: Number(stored.concurrency) || 4,
             targetLang: stored.targetLang || '简体中文',
             autoTranslate: Boolean(stored.autoTranslate),
+            showFloatBall: uiFeatureFlags.showFloatBall,
+            showSelectionDot: uiFeatureFlags.showSelectionDot,
+            showInputTranslate: uiFeatureFlags.showInputTranslate,
+            bilingualMode: uiFeatureFlags.bilingualMode,
             isMt
           });
         }
@@ -963,18 +1439,560 @@
     });
   }
 
+  function runtimeSend(payload) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(payload, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      });
+    });
+  }
+
+  function setFloatBallTranslating(active) {
+    if (!floatBallEl) return;
+    floatBallEl.classList.toggle('translating', Boolean(active));
+  }
+
+  function syncFloatBallLangSelect(targetLang) {
+    const select = floatBallEl?.querySelector('.arya-fb-lang');
+    if (!select || !targetLang) return;
+    if ([...select.options].some((o) => o.value === targetLang)) {
+      select.value = targetLang;
+    }
+  }
+
+  function syncFloatBallBilingualToggle(enabled) {
+    const toggle = floatBallEl?.querySelector('.arya-fb-bilingual');
+    if (toggle) toggle.checked = Boolean(enabled);
+  }
+
+  async function ensureFloatBall() {
+    if (!isTopFrame) return;
+    await getSettings();
+    if (!uiFeatureFlags.showFloatBall) {
+      if (floatBallEl) {
+        floatBallEl.remove();
+        floatBallEl = null;
+      }
+      return;
+    }
+    ensureOverlayStyles();
+    if (floatBallEl) {
+      const latest = await getSettings();
+      syncFloatBallLangSelect(latest.targetLang);
+      syncFloatBallBilingualToggle(latest.bilingualMode);
+      return;
+    }
+
+    const settings = await getSettings();
+    const ball = document.createElement('div');
+    ball.id = 'arya-float-ball';
+    ball.innerHTML = `
+      <button type="button" class="arya-fb-main" title="Arya Translate" aria-label="打开 Arya Translate">
+        <span class="arya-fb-icon">A</span>
+      </button>
+      <div class="arya-fb-panel">
+        <div class="arya-fb-title"><span class="arya-fb-title-dot"></span>Arya Translate</div>
+        <label class="arya-fb-label" for="arya-fb-lang">目标语言</label>
+        <select class="arya-fb-lang" id="arya-fb-lang">
+          ${TARGET_LANG_OPTIONS.map((lang) => (
+            `<option value="${escapeHtml(lang)}"${lang === settings.targetLang ? ' selected' : ''}>${escapeHtml(lang)}</option>`
+          )).join('')}
+        </select>
+        <label class="arya-fb-toggle">
+          <input type="checkbox" class="arya-fb-bilingual"${settings.bilingualMode ? ' checked' : ''}>
+          <span>双语对照（译文在下）</span>
+        </label>
+        <div class="arya-fb-actions">
+          <button type="button" class="arya-fb-btn translate" data-action="translate">翻译此页</button>
+          <button type="button" class="arya-fb-btn cancel" data-action="cancel">取消翻译</button>
+          <button type="button" class="arya-fb-btn restore" data-action="restore">恢复原文</button>
+        </div>
+      </div>
+    `;
+
+    const mainBtn = ball.querySelector('.arya-fb-main');
+    const langSelect = ball.querySelector('.arya-fb-lang');
+    const bilingualToggle = ball.querySelector('.arya-fb-bilingual');
+
+    mainBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      floatBallExpanded = !floatBallExpanded;
+      ball.classList.toggle('expanded', floatBallExpanded);
+    });
+
+    langSelect.addEventListener('change', async () => {
+      await chrome.storage.sync.set({ targetLang: langSelect.value });
+    });
+
+    bilingualToggle.addEventListener('change', async () => {
+      const bilingualMode = bilingualToggle.checked;
+      uiFeatureFlags.bilingualMode = bilingualMode;
+      if (activeSettings) activeSettings.bilingualMode = bilingualMode;
+      await chrome.storage.sync.set({ bilingualMode });
+    });
+
+    ball.querySelector('[data-action="translate"]').addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setFloatBallTranslating(true);
+      try {
+        await chrome.storage.sync.set({
+          targetLang: langSelect.value,
+          bilingualMode: bilingualToggle.checked
+        });
+        const result = await runtimeSend({ action: 'selfPageTranslate' });
+        if (result?.success) {
+          showOverlay(`完成！Arya 已翻译 ${result.count || 0} 段${result.estimatedTokens ? ` · 约 ${result.estimatedTokens.toLocaleString()} tokens` : ''}`, 100);
+          setTimeout(hideOverlay, 1500);
+        } else if (result?.error && !result?.cancelled) {
+          showOverlay(result.error, 0);
+          setTimeout(hideOverlay, 2200);
+        }
+      } catch (error) {
+        showOverlay(error.message || '翻译失败', 0);
+        setTimeout(hideOverlay, 2200);
+      } finally {
+        setFloatBallTranslating(isTranslating || isProcessingIncremental);
+      }
+    });
+
+    ball.querySelector('[data-action="cancel"]').addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        await runtimeSend({ action: 'selfBroadcast', contentAction: 'cancel' });
+      } catch {
+        cancelTranslation();
+      }
+      setFloatBallTranslating(false);
+    });
+
+    ball.querySelector('[data-action="restore"]').addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        await runtimeSend({ action: 'selfBroadcast', contentAction: 'restore' });
+        showOverlay('已恢复原文', 100);
+        setTimeout(hideOverlay, 1200);
+      } catch (error) {
+        restoreOriginal();
+        showOverlay(error.message || '已恢复原文', 100);
+        setTimeout(hideOverlay, 1200);
+      }
+      setFloatBallTranslating(false);
+    });
+
+    document.addEventListener('mousedown', (e) => {
+      if (!floatBallEl || !floatBallExpanded) return;
+      if (e.target?.closest?.('#arya-float-ball')) return;
+      floatBallExpanded = false;
+      floatBallEl.classList.remove('expanded');
+    }, true);
+
+    document.documentElement.appendChild(ball);
+    floatBallEl = ball;
+  }
+
+  function getEditableValue(el) {
+    if (!el) return '';
+    if (el.isContentEditable) return (el.innerText || el.textContent || '').trim();
+    return String(el.value || '').trim();
+  }
+
+  function setEditableValue(el, value) {
+    if (!el) return;
+    if (el.isContentEditable) {
+      el.focus();
+      el.textContent = value;
+      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      return;
+    }
+    const proto = el.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor?.set) descriptor.set.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function isSupportedEditable(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE || isOurOverlayElement(el)) return false;
+    if (el.isContentEditable) return true;
+    if (el.tagName === 'TEXTAREA') return !el.disabled && !el.readOnly;
+    if (el.tagName !== 'INPUT') return false;
+    const type = (el.type || 'text').toLowerCase();
+    if (['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image', 'range', 'color'].includes(type)) {
+      return false;
+    }
+    return !el.disabled && !el.readOnly;
+  }
+
+  function hideInputFab() {
+    if (inputFabHideTimer) {
+      clearTimeout(inputFabHideTimer);
+      inputFabHideTimer = null;
+    }
+    inputFabTarget = null;
+    if (inputFabEl) inputFabEl.style.display = 'none';
+  }
+
+  function positionInputFab(el) {
+    if (!inputFabEl || !el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 40 || rect.height < 18) {
+      inputFabEl.style.display = 'none';
+      return;
+    }
+    const top = Math.min(Math.max(rect.top + 4, 8), window.innerHeight - 36);
+    const left = Math.min(Math.max(rect.right - 78, 8), window.innerWidth - 86);
+    inputFabEl.style.top = `${top}px`;
+    inputFabEl.style.left = `${left}px`;
+    inputFabEl.style.display = 'block';
+  }
+
+  async function ensureInputFab() {
+    await getSettings();
+    if (!uiFeatureFlags.showInputTranslate) {
+      hideInputFab();
+      if (inputFabEl) {
+        inputFabEl.remove();
+        inputFabEl = null;
+      }
+      return;
+    }
+    ensureOverlayStyles();
+    if (inputFabEl) return;
+
+    const fab = document.createElement('div');
+    fab.id = 'arya-input-fab';
+    fab.innerHTML = '<button type="button" title="翻译当前输入框">译</button>';
+    const btn = fab.querySelector('button');
+
+    btn.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const target = inputFabTarget;
+      if (!target || !isSupportedEditable(target)) return;
+      const source = getEditableValue(target);
+      if (!source || source.length < 1) {
+        showOverlay('输入框里还没有可翻译的文字', 0);
+        setTimeout(hideOverlay, 1400);
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const settings = await getSettings();
+        const targetLang = resolveMutualTargetLang(source, settings.targetLang);
+        const [translated] = await translatePreviewTexts([source], targetLang);
+        const next = (translated || '').trim();
+        if (!next) throw new Error('未返回译文');
+        setEditableValue(target, next);
+        showOverlay(`输入框已译为 ${targetLang}`, 100);
+        setTimeout(hideOverlay, 1400);
+      } catch (error) {
+        showOverlay(error.message || '输入框翻译失败', 0);
+        setTimeout(hideOverlay, 2000);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '译';
+        if (inputFabTarget) positionInputFab(inputFabTarget);
+      }
+    });
+
+    document.documentElement.appendChild(fab);
+    inputFabEl = fab;
+  }
+
+  function showInputFabFor(el) {
+    if (!uiFeatureFlags.showInputTranslate || !isSupportedEditable(el)) {
+      hideInputFab();
+      return;
+    }
+    ensureInputFab().then(() => {
+      inputFabTarget = el;
+      positionInputFab(el);
+    });
+  }
+
+  function bindInputTranslateListeners() {
+    document.addEventListener('focusin', (e) => {
+      const el = e.target;
+      if (!isSupportedEditable(el)) return;
+      showInputFabFor(el);
+    }, true);
+
+    document.addEventListener('focusout', (e) => {
+      if (!inputFabEl) return;
+      const next = e.relatedTarget;
+      if (next && (next === inputFabEl || inputFabEl.contains(next))) return;
+      inputFabHideTimer = setTimeout(() => {
+        if (document.activeElement && isSupportedEditable(document.activeElement)) {
+          showInputFabFor(document.activeElement);
+          return;
+        }
+        hideInputFab();
+      }, 180);
+    }, true);
+
+    document.addEventListener('scroll', () => {
+      if (inputFabTarget) positionInputFab(inputFabTarget);
+    }, true);
+
+    window.addEventListener('resize', () => {
+      if (inputFabTarget) positionInputFab(inputFabTarget);
+    });
+  }
+
+  async function refreshUiWidgets() {
+    await getSettings();
+    await ensureFloatBall();
+    await ensureInputFab();
+    if (!uiFeatureFlags.showSelectionDot) hideSelectionBubble();
+    if (!uiFeatureFlags.showInputTranslate) hideInputFab();
+    setFloatBallTranslating(isTranslating || isProcessingIncremental);
+  }
+
+  const PARA_BLOCK_TAGS = new Set([
+    'P', 'LI', 'DD', 'DT', 'BLOCKQUOTE', 'FIGCAPTION',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+    'TD', 'TH', 'ARTICLE'
+  ]);
+
+  function hasBlockLevelChild(el) {
+    if (!el?.children) return false;
+    for (const child of el.children) {
+      const tag = child.tagName;
+      if (PARA_BLOCK_TAGS.has(tag)) return true;
+      if (tag === 'DIV' || tag === 'SECTION' || tag === 'UL' || tag === 'OL'
+        || tag === 'TABLE' || tag === 'FORM' || tag === 'DL') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isCompactTranslationContext(el) {
+    if (!el) return false;
+    return Boolean(
+      el.closest(
+        'nav, aside, header, footer, [role="navigation"], [role="menubar"], [role="menu"], [role="tablist"], [role="toolbar"], [role="banner"]'
+      )
+    );
+  }
+
+  function findInteractiveHost(node) {
+    if (!node?.parentElement) return null;
+    return node.parentElement.closest(
+      'a, button, summary, [role="link"], [role="button"], [role="menuitem"], [role="tab"]'
+    );
+  }
+
+  function getHostVisibleText(host) {
+    if (!host) return '';
+    try {
+      const clone = host.cloneNode(true);
+      clone.querySelectorAll(
+        '.arya-bilingual, [data-arya-bilingual], script, style, noscript, .sr-only, .visually-hidden, [aria-hidden="true"]'
+      ).forEach((el) => el.remove());
+      return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+    } catch {
+      return (host.innerText || host.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  function findTranslationBlock(node) {
+    if (findInteractiveHost(node)) return null;
+    let el = node.parentElement;
+    let divFallback = null;
+    while (el && el !== document.body && el !== document.documentElement) {
+      if (shouldSkipElement(el)) return null;
+      if (isCompactTranslationContext(el)) return null;
+      if (PARA_BLOCK_TAGS.has(el.tagName)) return el;
+      if ((el.tagName === 'DIV' || el.tagName === 'SECTION') && !hasBlockLevelChild(el)) {
+        if (!divFallback) divFallback = el;
+      }
+      el = el.parentElement;
+    }
+    return divFallback;
+  }
+
+  function compareDocumentOrder(a, b) {
+    if (a === b) return 0;
+    const pos = a.compareDocumentPosition(b);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  }
+
+  function groupTextNodesIntoUnits(textNodes) {
+    const hostBuckets = new Map();
+    const blockBuckets = new Map();
+    const singles = [];
+
+    for (const node of textNodes) {
+      if (!node?.isConnected) continue;
+      const text = node.textContent?.trim() || '';
+      if (!text || isLikelyNonTranslatable(text)) continue;
+
+      // 链接/按钮：整颗控件只译一次，避免「联系销售」出两条译文
+      const host = findInteractiveHost(node);
+      if (host) {
+        let bucket = hostBuckets.get(host);
+        if (!bucket) {
+          bucket = { host, nodes: [] };
+          hostBuckets.set(host, bucket);
+        }
+        bucket.nodes.push(node);
+        continue;
+      }
+
+      const block = findTranslationBlock(node);
+      if (!block) {
+        singles.push({
+          __aryaUnit: true,
+          kind: 'node',
+          node,
+          nodes: [node],
+          text
+        });
+        continue;
+      }
+
+      let bucket = blockBuckets.get(block);
+      if (!bucket) {
+        bucket = { block, nodes: [] };
+        blockBuckets.set(block, bucket);
+      }
+      bucket.nodes.push(node);
+    }
+
+    const units = [];
+
+    for (const { host, nodes } of hostBuckets.values()) {
+      const ordered = [...new Set(nodes)].sort(compareDocumentOrder);
+      const text = getHostVisibleText(host)
+        || ordered.map((n) => (n.textContent || '').trim()).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      if (!text || isLikelyNonTranslatable(text)) continue;
+      units.push({
+        __aryaUnit: true,
+        kind: 'host',
+        host,
+        nodes: ordered,
+        text
+      });
+    }
+
+    for (const { block, nodes } of blockBuckets.values()) {
+      const ordered = [...new Set(nodes)].sort(compareDocumentOrder);
+      const text = ordered
+        .map((n) => (n.textContent || '').trim())
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!text || isLikelyNonTranslatable(text)) continue;
+
+      if (ordered.length === 1 && text.length < 42) {
+        units.push({
+          __aryaUnit: true,
+          kind: 'node',
+          node: ordered[0],
+          nodes: ordered,
+          text
+        });
+        continue;
+      }
+
+      if (ordered.length > 48 || text.length > 4500) {
+        for (const node of ordered) {
+          const t = (node.textContent || '').trim();
+          if (!t || isLikelyNonTranslatable(t)) continue;
+          units.push({
+            __aryaUnit: true,
+            kind: 'node',
+            node,
+            nodes: [node],
+            text: t
+          });
+        }
+        continue;
+      }
+
+      units.push({
+        __aryaUnit: true,
+        kind: 'block',
+        block,
+        nodes: ordered,
+        text
+      });
+    }
+
+    return units.concat(singles);
+  }
+
+  function expandNodesForBilingualBlocks(nodes) {
+    if (!isBilingualMode()) return nodes;
+    const seenBlocks = new Set();
+    const seenNodes = new Set();
+    const out = [];
+
+    for (const node of nodes) {
+      if (!node?.isConnected || seenNodes.has(node)) continue;
+      const block = findTranslationBlock(node);
+      if (!block || isCompactTranslationContext(block)) {
+        seenNodes.add(node);
+        out.push(node);
+        continue;
+      }
+      if (seenBlocks.has(block)) continue;
+      seenBlocks.add(block);
+      const collected = [];
+      collectTextNodesFromRootTree(block, collected, null);
+      for (const n of collected) {
+        if (seenNodes.has(n)) continue;
+        seenNodes.add(n);
+        out.push(n);
+      }
+    }
+    return out;
+  }
+
   function buildUniqueTextPlan(textNodes) {
     const textToNodes = new Map();
     const uniqueTexts = [];
 
-    for (const node of textNodes) {
-      const text = node.textContent.trim();
+    const targets = isBilingualMode()
+      ? groupTextNodesIntoUnits(textNodes)
+      : textNodes;
+
+    for (const target of targets) {
+      const text = target?.__aryaUnit
+        ? target.text
+        : (target?.textContent || '').trim();
       if (!text || isLikelyNonTranslatable(text)) continue;
       if (!textToNodes.has(text)) {
         textToNodes.set(text, []);
         uniqueTexts.push(text);
       }
-      textToNodes.get(text).push(node);
+      textToNodes.get(text).push(
+        target?.__aryaUnit
+          ? target
+          : { __aryaUnit: true, kind: 'node', node: target, nodes: [target], text }
+      );
     }
 
     return {
@@ -1140,7 +2158,195 @@
     }, 3000);
   }
 
+  function resolveBilingualPlacement(nodeOrHost, originalText, translatedText, { forceInline = false } = {}) {
+    if (forceInline) return 'inline';
+
+    const el = nodeOrHost?.nodeType === Node.ELEMENT_NODE
+      ? nodeOrHost
+      : nodeOrHost?.parentElement;
+    // 导航 / 顶栏短标签：译文跟在右侧
+    if (el && isCompactTranslationContext(el)) return 'inline';
+    if (el && findInteractiveHost(el) && String(originalText || '').trim().length <= 40) {
+      return 'inline';
+    }
+
+    const src = String(originalText || '').replace(/\s+/g, ' ').trim();
+    const dst = String(translatedText || '').replace(/\s+/g, ' ').trim();
+    if (!src || !dst) return 'block';
+
+    if (src.length > 48 || dst.length > 48) return 'block';
+    if (/[\n\r]/.test(String(originalText || '')) || /[\n\r]/.test(String(translatedText || ''))) {
+      return 'block';
+    }
+    if (src.length > 22 && (src.match(/[.!?。！？]/g) || []).length >= 1) return 'block';
+
+    const parent = el;
+    if (!parent) return src.length <= 24 ? 'inline' : 'block';
+
+    if (/^H[1-6]$/.test(parent.tagName)) {
+      return src.length <= 34 && dst.length <= 30 ? 'inline' : 'block';
+    }
+
+    if (src.length <= 24 && dst.length <= 22) return 'inline';
+    return 'block';
+  }
+
+  function bilingualClassForPlacement(placement) {
+    if (placement === 'inline') return 'arya-bilingual arya-bilingual-inline';
+    return 'arya-bilingual arya-bilingual-block';
+  }
+
+  function clearBilingualHosts(scope) {
+    if (!scope?.querySelectorAll) return;
+    scope.querySelectorAll('[data-arya-bilingual-host]').forEach((el) => {
+      el.removeAttribute('data-arya-bilingual-host');
+    });
+  }
+
+  function removeBlockBilingual(blockEl) {
+    if (!blockEl) return;
+    const cached = bilingualElements.get(blockEl);
+    isApplyingTranslation = true;
+    try {
+      if (cached?.isConnected) cached.remove();
+      blockEl.querySelectorAll(':scope > .arya-bilingual[data-arya-block="1"]').forEach((el) => {
+        el.remove();
+      });
+    } finally {
+      isApplyingTranslation = false;
+    }
+    bilingualElements.delete(blockEl);
+  }
+
+  function applyBilingualHostTranslation(host, nodes, translated) {
+    if (!host?.isConnected || !isValidTranslation(translated)) return;
+
+    for (const node of nodes) {
+      if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
+      removeBilingualElement(node);
+    }
+
+    isApplyingTranslation = true;
+    try {
+      host.querySelectorAll('.arya-bilingual').forEach((el) => el.remove());
+      const cached = bilingualElements.get(host);
+      if (cached?.isConnected) cached.remove();
+
+      const el = document.createElement('span');
+      el.setAttribute('translate', 'no');
+      el.setAttribute('data-arya-bilingual', '1');
+      el.setAttribute('data-arya-host', '1');
+      el.className = bilingualClassForPlacement('inline');
+      el.textContent = translated;
+      host.appendChild(el);
+      bilingualElements.set(host, el);
+      host.setAttribute('data-arya-bilingual-host', '1');
+    } finally {
+      isApplyingTranslation = false;
+    }
+  }
+
+  function applyBilingualBlockTranslation(blockEl, nodes, translated) {
+    if (!blockEl?.isConnected || !isValidTranslation(translated)) return;
+
+    for (const node of nodes) {
+      if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
+      removeBilingualElement(node);
+    }
+    removeBlockBilingual(blockEl);
+
+    const sampleNode = nodes[0];
+    const joinedOriginal = nodes
+      .map((n) => translatedNodes.get(n) ?? n.textContent)
+      .join(' ');
+    const placement = resolveBilingualPlacement(blockEl, joinedOriginal, translated);
+
+    isApplyingTranslation = true;
+    try {
+      const el = document.createElement('span');
+      el.setAttribute('translate', 'no');
+      el.setAttribute('data-arya-bilingual', '1');
+      el.setAttribute('data-arya-block', '1');
+      el.className = bilingualClassForPlacement(placement);
+      el.textContent = translated;
+      blockEl.appendChild(el);
+      bilingualElements.set(blockEl, el);
+    } finally {
+      isApplyingTranslation = false;
+    }
+  }
+
+  function applyBilingualTranslation(node, translated) {
+    if (!node?.parentNode || !isValidTranslation(translated)) return;
+
+    // 若已在链接/按钮宿主上挂过译文，不再给内部 text node 重复挂
+    const host = findInteractiveHost(node);
+    if (host && bilingualElements.get(host)?.isConnected) {
+      if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
+      return;
+    }
+
+    const stored = translatedNodes.get(node);
+    if (stored == null) {
+      translatedNodes.set(node, node.textContent);
+    } else if (node.textContent !== stored) {
+      isApplyingTranslation = true;
+      try {
+        node.textContent = stored;
+      } finally {
+        isApplyingTranslation = false;
+      }
+    }
+
+    const originalText = translatedNodes.get(node) ?? node.textContent;
+    const placement = resolveBilingualPlacement(node, originalText, translated);
+
+    isApplyingTranslation = true;
+    try {
+      let el = findBilingualElement(node);
+      if (!el) {
+        el = document.createElement('span');
+        el.setAttribute('translate', 'no');
+        el.setAttribute('data-arya-bilingual', '1');
+        if (node.nextSibling) node.parentNode.insertBefore(el, node.nextSibling);
+        else node.parentNode.appendChild(el);
+        bilingualElements.set(node, el);
+      }
+      el.className = bilingualClassForPlacement(placement);
+      el.textContent = translated;
+    } finally {
+      isApplyingTranslation = false;
+    }
+  }
+
+  function applyTranslationUnit(unit, translated) {
+    if (!unit || !isValidTranslation(translated)) return;
+    if (unit.kind === 'host' && unit.host && isBilingualMode()) {
+      applyBilingualHostTranslation(unit.host, unit.nodes || [], translated);
+      return;
+    }
+    if (unit.kind === 'block' && unit.block && isBilingualMode()) {
+      applyBilingualBlockTranslation(unit.block, unit.nodes || [], translated);
+      return;
+    }
+    const nodes = unit.nodes || (unit.node ? [unit.node] : []);
+    for (const node of nodes) applyTranslation(node, translated);
+  }
+
   function applyTranslation(node, translated) {
+    if (!isValidTranslation(translated)) return;
+
+    if (node?.__aryaUnit) {
+      applyTranslationUnit(node, translated);
+      return;
+    }
+
+    if (isBilingualMode()) {
+      applyBilingualTranslation(node, translated);
+      return;
+    }
+
+    removeBilingualElement(node);
     if (!translatedNodes.has(node)) {
       translatedNodes.set(node, node.textContent);
     }
@@ -1200,6 +2406,11 @@
       }
     });
 
+    scope.querySelectorAll('.arya-bilingual, [data-arya-bilingual="1"]').forEach((el) => {
+      el.remove();
+    });
+    clearBilingualHosts(scope);
+
     const elWalker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
     while (elWalker.nextNode()) {
       const el = elWalker.currentNode;
@@ -1229,6 +2440,7 @@
     markAutoTranslateSkippedForPage();
     sessionId = null;
     resetSessionUsage();
+    setPageTranslationActive(false);
     isApplyingTranslation = true;
     try {
       if (document.body) restoreInRoot(document.body);
@@ -1256,6 +2468,7 @@
       chrome.runtime.sendMessage({ action: 'cancelSession', sessionId: sid });
     }
     sessionId = null;
+    setFloatBallTranslating(false);
     showCancelledAndHide();
   }
 
@@ -1471,14 +2684,19 @@
     if (!watchModeActive || isProcessingIncremental || isTranslating || cancelRequested) return;
     if (!pendingIncrementalNodes.size || !activeSettings) return;
 
-    const nodes = [...pendingIncrementalNodes].filter((n) => {
+    const rawNodes = [...pendingIncrementalNodes].filter((n) => {
       if (!n?.isConnected) return false;
-      if (shouldSkipNode(n)) return false;
       if (isNoisyParent(n.parentElement)) return false;
       const text = n.textContent?.trim() || '';
       return text.length >= 2 && !isLikelyNonTranslatable(text);
     });
     pendingIncrementalNodes.clear();
+    const nodes = expandNodesForBilingualBlocks(rawNodes).filter((n) => {
+      if (!n?.isConnected) return false;
+      if (shouldSkipNode(n)) return false;
+      const text = n.textContent?.trim() || '';
+      return text.length >= 2 && !isLikelyNonTranslatable(text);
+    });
     if (!nodes.length) return;
 
     isProcessingIncremental = true;
@@ -1746,6 +2964,7 @@
 
     try {
       const settings = await getSettings();
+      activeSettings = settings;
       showOverlay(`Arya 正在翻译「${selectedText.slice(0, 24)}${selectedText.length > 24 ? '…' : ''}」`, 15);
       const result = await translateSelectionSegments(segments, settings);
 
@@ -1769,6 +2988,7 @@
     } finally {
       isTranslating = false;
       cancelRequested = false;
+      setFloatBallTranslating(false);
     }
   }
 
@@ -1787,6 +3007,20 @@
 
     try {
       const settings = await getSettings();
+      activeSettings = settings;
+
+      // 已翻译时再点「翻译此页」：先恢复，再按当前模式（含双语）重译
+      const alreadyTranslated = isPageTranslationActive()
+        || Boolean(document.querySelector('.arya-bilingual, [data-arya-bilingual="1"]'));
+      if (alreadyTranslated) {
+        showOverlay(
+          settings.bilingualMode ? '正在切换为双语对照…' : '正在按当前模式重新翻译…',
+          5
+        );
+        restoreOriginal();
+        await yieldToMain();
+      }
+
       const scannedNodes = await collectTextNodesAsync((msg) => {
         showOverlay(msg, 0);
       }, null);
@@ -1824,6 +3058,8 @@
       const stillMissed = missedAfterSweep.length;
       const usage = formatUsageSuffix();
 
+      if (successCount > 0) setPageTranslationActive(true);
+
       if (failedNodeCount > 0 || stillMissed > 0) {
         const totalAttempted = successCount + failedNodeCount + stillMissed;
         showOverlay(`完成！${successCount}/${totalAttempted} 段已翻译${usage}`, 100);
@@ -1859,6 +3095,7 @@
     } finally {
       isTranslating = false;
       cancelRequested = false;
+      setFloatBallTranslating(false);
     }
   }
 
@@ -1868,20 +3105,24 @@
         sendResponse({ success: true, skipped: true, count: 0 });
         return true;
       }
+      setFloatBallTranslating(true);
       translatePage().then(sendResponse);
       return true;
     }
     if (message.action === 'translateSelection') {
+      setFloatBallTranslating(true);
       translateSelection(message).then(sendResponse);
       return true;
     }
     if (message.action === 'cancel') {
       cancelTranslation();
+      setFloatBallTranslating(false);
       sendResponse({ success: true, cancelled: true });
       return true;
     }
     if (message.action === 'restore') {
       restoreOriginal();
+      setFloatBallTranslating(false);
       sendResponse({ success: true });
       return true;
     }
@@ -1891,6 +3132,14 @@
     }
     if (message.action === 'getWatchMode') {
       sendResponse({ watchModeActive });
+      return true;
+    }
+    if (message.action === 'getPageTranslateState') {
+      sendResponse({
+        translated: isPageTranslationActive(),
+        watchModeActive,
+        isTranslating: isTranslating || isProcessingIncremental
+      });
       return true;
     }
     return false;
@@ -1905,8 +3154,27 @@
   window.addEventListener('popstate', scheduleAutoTranslate);
   window.addEventListener('hashchange', scheduleAutoTranslate);
 
+  bindInputTranslateListeners();
+  refreshUiWidgets();
+
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'sync' || !changes.autoTranslate?.newValue) return;
-    scheduleAutoTranslate();
+    if (area !== 'sync') return;
+    if (changes.autoTranslate?.newValue) scheduleAutoTranslate();
+    if (
+      changes.targetLang
+      || changes.showFloatBall
+      || changes.showSelectionDot
+      || changes.showInputTranslate
+      || changes.bilingualMode
+    ) {
+      refreshUiWidgets();
+      if (changes.targetLang?.newValue) syncFloatBallLangSelect(changes.targetLang.newValue);
+      if (changes.bilingualMode) {
+        const enabled = Boolean(changes.bilingualMode.newValue);
+        uiFeatureFlags.bilingualMode = enabled;
+        if (activeSettings) activeSettings.bilingualMode = enabled;
+        syncFloatBallBilingualToggle(enabled);
+      }
+    }
   });
 })();
