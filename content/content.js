@@ -1,4 +1,8 @@
 (function () {
+  // 防止 background 重复 executeScript 导致多个监听器、多个粉点
+  if (window.__ARYA_TRANSLATE_CS__) return;
+  window.__ARYA_TRANSLATE_CS__ = true;
+
   const SKIP_TAGS = new Set([
     'SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'CODE', 'PRE',
     'TEXTAREA', 'INPUT', 'SELECT', 'OPTION'
@@ -63,6 +67,7 @@
   let currentLangHint = '';
   let selectionBubbleEl = null;
   let selectionBubbleRaf = null;
+  let selectionBubbleTimer = null;
   let selectionPanelEl = null;
   let selectionPanelHideTimer = null;
   let selectionPreviewToken = 0;
@@ -79,10 +84,84 @@
     showFloatBall: true,
     showSelectionDot: true,
     showInputTranslate: true,
-    bilingualMode: false
+    bilingualMode: false,
+    selectionDelayMs: 280,
+    selectionMinLength: 4
   };
+  let activeSkipSelectors = [];
   const bilingualElements = new WeakMap();
   let pageTranslationActive = false;
+
+  const SITE_RULES_MAX = 50;
+
+  function normalizeSiteRules(raw) {
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const item of raw) {
+      const host = String(item?.host || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^\*\./, '')
+        .replace(/^https?:\/\//, '')
+        .split('/')[0];
+      if (!host || seen.has(host)) continue;
+      seen.add(host);
+      const tri = (v) => (v === true || v === false ? v : null);
+      out.push({
+        host,
+        bilingualMode: tri(item?.bilingualMode),
+        watchMode: tri(item?.watchMode),
+        autoTranslate: tri(item?.autoTranslate),
+        skipSelectors: String(item?.skipSelectors || '').trim()
+      });
+      if (out.length >= SITE_RULES_MAX) break;
+    }
+    return out;
+  }
+
+  function matchSiteRule(hostname, rules) {
+    if (!hostname || !rules?.length) return null;
+    const host = String(hostname).toLowerCase();
+    let best = null;
+    let bestLen = -1;
+    for (const rule of rules) {
+      const h = rule.host;
+      if (!h) continue;
+      if (host === h || host.endsWith(`.${h}`)) {
+        if (h.length > bestLen) {
+          best = rule;
+          bestLen = h.length;
+        }
+      }
+    }
+    return best;
+  }
+
+  function parseSkipSelectors(str) {
+    if (!str || typeof str !== 'string') return [];
+    return str.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  function applySiteRuleToSettings(settings, rule) {
+    if (!rule) {
+      return {
+        ...settings,
+        watchMode: null,
+        skipSelectors: '',
+        siteRule: null
+      };
+    }
+    const next = { ...settings, siteRule: rule, skipSelectors: rule.skipSelectors || '' };
+    if (rule.bilingualMode === true || rule.bilingualMode === false) {
+      next.bilingualMode = rule.bilingualMode;
+    }
+    if (rule.autoTranslate === true || rule.autoTranslate === false) {
+      next.autoTranslate = rule.autoTranslate;
+    }
+    next.watchMode = rule.watchMode === true || rule.watchMode === false ? rule.watchMode : null;
+    return next;
+  }
 
   function setPageTranslationActive(active) {
     pageTranslationActive = Boolean(active);
@@ -328,7 +407,8 @@
       return;
     }
     const text = sel.toString().trim();
-    if (!text) {
+    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
+    if (!text || text.length < minLen) {
       hideSelectionBubble();
       return;
     }
@@ -363,6 +443,10 @@
   }
 
   function hideSelectionBubble() {
+    if (selectionBubbleTimer) {
+      clearTimeout(selectionBubbleTimer);
+      selectionBubbleTimer = null;
+    }
     if (selectionBubbleRaf) {
       cancelAnimationFrame(selectionBubbleRaf);
       selectionBubbleRaf = null;
@@ -371,6 +455,21 @@
     if (selectionBubbleEl) {
       selectionBubbleEl.remove();
       selectionBubbleEl = null;
+    }
+    // 清掉历史重复注入残留的粉点
+    document.querySelectorAll('#arya-selection-bubble, .arya-selection-bubble').forEach((el) => {
+      el.remove();
+    });
+  }
+
+  function selectionBelongsToThisFrame(range) {
+    try {
+      const root = range?.commonAncestorContainer;
+      if (!root) return false;
+      const node = root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement;
+      return Boolean(node && document.documentElement.contains(node));
+    } catch {
+      return false;
     }
   }
 
@@ -521,11 +620,40 @@
   }
 
   function scheduleSelectionBubble() {
-    if (selectionBubbleRaf) cancelAnimationFrame(selectionBubbleRaf);
-    selectionBubbleRaf = requestAnimationFrame(() => {
+    if (selectionBubbleRaf) {
+      cancelAnimationFrame(selectionBubbleRaf);
       selectionBubbleRaf = null;
-      showSelectionBubble();
-    });
+    }
+    if (selectionBubbleTimer) {
+      clearTimeout(selectionBubbleTimer);
+      selectionBubbleTimer = null;
+    }
+    // 已有粉点时（如滚动跟随）立即重定位；新选区则短延迟再出点
+    const delay = selectionBubbleEl
+      ? 0
+      : Math.max(0, Number(uiFeatureFlags.selectionDelayMs) || 280);
+    selectionBubbleTimer = setTimeout(() => {
+      selectionBubbleTimer = null;
+      selectionBubbleRaf = requestAnimationFrame(() => {
+        selectionBubbleRaf = null;
+        showSelectionBubble();
+      });
+    }, delay);
+  }
+
+  function onSelectionScroll() {
+    const sel = window.getSelection();
+    if (!sel?.rangeCount || sel.isCollapsed) {
+      hideSelectionBubble();
+      return;
+    }
+    const text = sel.toString().trim();
+    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
+    if (!text || text.length < minLen) {
+      hideSelectionBubble();
+      return;
+    }
+    scheduleSelectionBubble();
   }
 
   function positionSelectionPanel(panel, anchorRect) {
@@ -663,7 +791,8 @@
     }
 
     const text = sel.toString().trim();
-    if (!text || text.length < 2 || isLikelyNonTranslatable(text)) {
+    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
+    if (!text || text.length < minLen || isLikelyNonTranslatable(text)) {
       hideSelectionBubble();
       return;
     }
@@ -672,6 +801,10 @@
     let allowApply = true;
     try {
       range = sel.getRangeAt(0);
+      if (!selectionBelongsToThisFrame(range)) {
+        hideSelectionBubble();
+        return;
+      }
       allowApply = !isSelectionInEditableContext(range);
     } catch {
       hideSelectionBubble();
@@ -681,18 +814,23 @@
     ensureOverlayStyles();
     hideSelectionBubble();
 
-    const rect = range.getBoundingClientRect();
-    if (!rect.width && !rect.height) {
+    // 多行选区时 getBoundingClientRect 会很大，粉点易飞到很远；改用末尾可见小矩形
+    const clientRects = [...range.getClientRects()].filter((r) => r.width > 0 || r.height > 0);
+    const rect = clientRects.length
+      ? clientRects[clientRects.length - 1]
+      : range.getBoundingClientRect();
+    if (!rect || (!rect.width && !rect.height)) {
       hideSelectionBubble();
       return;
     }
 
     const bubble = document.createElement('div');
     bubble.id = 'arya-selection-bubble';
+    bubble.className = 'arya-selection-bubble';
     bubble.innerHTML = '<button type="button" class="arya-sel-dot" title="悬停查看译文" aria-label="翻译预览"></button>';
 
-    const left = Math.min(Math.max(rect.right + 6, 8), window.innerWidth - 22);
-    const top = Math.min(Math.max(rect.top + rect.height / 2 - 7, 8), window.innerHeight - 22);
+    const left = Math.min(Math.max(rect.right + 4, 8), window.innerWidth - 22);
+    const top = Math.min(Math.max(rect.top + Math.min(rect.height, 22) / 2 - 7, 8), window.innerHeight - 22);
     bubble.style.left = `${left}px`;
     bubble.style.top = `${top}px`;
 
@@ -726,7 +864,7 @@
 
   document.addEventListener('mouseup', updateCachedSelection, true);
   document.addEventListener('keyup', updateCachedSelection, true);
-  document.addEventListener('scroll', hideSelectionBubble, true);
+  document.addEventListener('scroll', onSelectionScroll, true);
   document.addEventListener('mousemove', onOriginalTooltipMove, true);
   document.addEventListener('scroll', hideOriginalTooltip, true);
   document.addEventListener('mousedown', (e) => {
@@ -805,6 +943,13 @@
     if (el.getAttribute('translate') === 'no') return true;
     for (const cls of el.classList || []) {
       if (SKIP_ANCESTOR_CLASSES.has(cls)) return true;
+    }
+    for (const sel of activeSkipSelectors) {
+      try {
+        if (el.matches(sel) || el.closest(sel)) return true;
+      } catch {
+        // invalid selector — ignore
+      }
     }
     return false;
   }
@@ -1072,7 +1217,7 @@
   }
 
   function ensureOverlayStyles() {
-    const STYLE_VERSION = '8';
+    const STYLE_VERSION = '11';
     let style = document.getElementById('bailian-translate-styles');
     if (style?.dataset?.version === STYLE_VERSION) return;
     if (!style) {
@@ -1273,19 +1418,45 @@
         opacity: 0.75 !important;
         font-size: 0.9em !important;
         line-height: inherit !important;
-        white-space: nowrap !important;
+        white-space: normal !important;
         vertical-align: baseline !important;
         font-weight: 500 !important;
       }
       .arya-bilingual.arya-bilingual-block {
         display: block !important;
-        margin: 0.18em 0 0.5em !important;
-        padding: 0.1em 0 0.1em 0.7em !important;
+        position: relative !important;
+        z-index: 1 !important;
+        clear: both !important;
+        float: none !important;
+        width: auto !important;
+        max-width: 100% !important;
+        box-sizing: border-box !important;
+        margin: 0.2em 0 0.45em !important;
+        padding: 0.12em 0 0.12em 0.65em !important;
         border-left: 2.5px solid #c4b5fd !important;
-        opacity: 0.88 !important;
-        font-size: inherit !important;
+        opacity: 0.9 !important;
+        font-size: 0.95em !important;
         line-height: 1.55 !important;
         white-space: pre-wrap !important;
+        background: transparent !important;
+        pointer-events: none !important;
+      }
+      [data-arya-expand="1"] {
+        height: auto !important;
+        max-height: none !important;
+        min-height: 0 !important;
+        overflow: visible !important;
+        -webkit-line-clamp: unset !important;
+        line-clamp: unset !important;
+        text-overflow: clip !important;
+        white-space: normal !important;
+        flex-shrink: 0 !important;
+      }
+      [data-arya-expand-scroll="1"] {
+        height: auto !important;
+        max-height: none !important;
+        -webkit-line-clamp: unset !important;
+        line-clamp: unset !important;
       }
       #arya-input-fab {
         position: fixed; z-index: 2147483644; display: none;
@@ -1413,7 +1584,10 @@
           showFloatBall: true,
           showSelectionDot: true,
           showInputTranslate: true,
-          bilingualMode: false
+          bilingualMode: false,
+          siteRules: [],
+          selectionDelayMs: 280,
+          selectionMinLength: 4
         },
         (stored) => {
           const isMt = stored.model?.trim().toLowerCase().startsWith('qwen-mt');
@@ -1421,9 +1595,11 @@
             showFloatBall: stored.showFloatBall !== false,
             showSelectionDot: stored.showSelectionDot !== false,
             showInputTranslate: stored.showInputTranslate !== false,
-            bilingualMode: Boolean(stored.bilingualMode)
+            bilingualMode: Boolean(stored.bilingualMode),
+            selectionDelayMs: Math.max(0, Number(stored.selectionDelayMs) || 280),
+            selectionMinLength: Math.max(1, Number(stored.selectionMinLength) || 4)
           };
-          resolve({
+          let settings = {
             batchSize: Number(stored.batchSize) || 40,
             concurrency: Number(stored.concurrency) || 4,
             targetLang: stored.targetLang || '简体中文',
@@ -1432,8 +1608,20 @@
             showSelectionDot: uiFeatureFlags.showSelectionDot,
             showInputTranslate: uiFeatureFlags.showInputTranslate,
             bilingualMode: uiFeatureFlags.bilingualMode,
+            selectionDelayMs: uiFeatureFlags.selectionDelayMs,
+            selectionMinLength: uiFeatureFlags.selectionMinLength,
+            watchMode: null,
+            skipSelectors: '',
+            siteRule: null,
             isMt
-          });
+          };
+          const rule = matchSiteRule(location.hostname, normalizeSiteRules(stored.siteRules));
+          settings = applySiteRuleToSettings(settings, rule);
+          activeSkipSelectors = parseSkipSelectors(settings.skipSelectors);
+          if (settings.bilingualMode !== uiFeatureFlags.bilingualMode) {
+            uiFeatureFlags.bilingualMode = settings.bilingualMode;
+          }
+          resolve(settings);
         }
       );
     });
@@ -1801,16 +1989,83 @@
     );
   }
 
+  function isEffectivelyVisible(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    try {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (parseFloat(style.opacity || '1') === 0) return false;
+      // 响应式隐藏（如 lg:hidden / hidden）在真实布局里通常没有盒模型
+      if (el.getClientRects().length === 0) return false;
+    } catch {
+      return true;
+    }
+    return true;
+  }
+
+  function dedupeNestedPhrases(parts) {
+    const cleaned = parts.map((p) => String(p || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    // 「Contact」被「Contact sales」包含时只保留更长的，避免译成「联系联系销售」
+    return cleaned.filter((part, index) => {
+      const lower = part.toLowerCase();
+      return !cleaned.some((other, otherIndex) => {
+        if (index === otherIndex) return false;
+        const otherLower = other.toLowerCase();
+        return otherLower !== lower && otherLower.includes(lower);
+      });
+    });
+  }
+
   function getHostVisibleText(host) {
     if (!host) return '';
+    const parts = [];
     try {
-      const clone = host.cloneNode(true);
-      clone.querySelectorAll(
-        '.arya-bilingual, [data-arya-bilingual], script, style, noscript, .sr-only, .visually-hidden, [aria-hidden="true"]'
-      ).forEach((el) => el.remove());
-      return (clone.innerText || clone.textContent || '').replace(/\s+/g, ' ').trim();
+      const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const raw = node.textContent || '';
+          if (!raw.trim()) return NodeFilter.FILTER_REJECT;
+          const parent = node.parentElement;
+          if (!parent) return NodeFilter.FILTER_REJECT;
+          if (parent.closest('.arya-bilingual, [data-arya-bilingual], script, style, noscript, .sr-only, .visually-hidden, [aria-hidden="true"]')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          let el = parent;
+          while (el && el !== host.parentElement) {
+            if (el !== host && !isEffectivelyVisible(el)) return NodeFilter.FILTER_REJECT;
+            if (el === host) break;
+            el = el.parentElement;
+          }
+          if (!isEffectivelyVisible(host) && host.getClientRects().length === 0) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      while (walker.nextNode()) {
+        parts.push(walker.currentNode.textContent.trim());
+      }
     } catch {
-      return (host.innerText || host.textContent || '').replace(/\s+/g, ' ').trim();
+      // fallback below
+    }
+
+    let text = dedupeNestedPhrases(parts).join(' ').replace(/\s+/g, ' ').trim();
+    if (text) return text;
+
+    // 回退：对整段文案做包含去重
+    try {
+      const raw = (host.innerText || host.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!raw) return '';
+      // 若像「Contact Contact sales」这种拼接，压成最长短语
+      const tokens = raw.split(' ').filter(Boolean);
+      if (tokens.length >= 2) {
+        const collapsed = dedupeNestedPhrases([raw, ...tokens]);
+        if (collapsed.length === 1) return collapsed[0];
+        // 取最长片段
+        return collapsed.sort((a, b) => b.length - a.length)[0] || raw;
+      }
+      return raw;
+    } catch {
+      return (host.textContent || '').replace(/\s+/g, ' ').trim();
     }
   }
 
@@ -1884,14 +2139,25 @@
 
     for (const { host, nodes } of hostBuckets.values()) {
       const ordered = [...new Set(nodes)].sort(compareDocumentOrder);
+      // 只保留当前真正可见的节点，避免 mobile/desktop 双文案都被送去翻译
+      const visibleNodes = ordered.filter((node) => {
+        let el = node.parentElement;
+        while (el && el !== host.parentElement) {
+          if (el !== host && !isEffectivelyVisible(el)) return false;
+          if (el === host) break;
+          el = el.parentElement;
+        }
+        return true;
+      });
+      const nodesForUnit = visibleNodes.length ? visibleNodes : ordered;
       const text = getHostVisibleText(host)
-        || ordered.map((n) => (n.textContent || '').trim()).filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+        || dedupeNestedPhrases(nodesForUnit.map((n) => (n.textContent || '').trim())).join(' ').replace(/\s+/g, ' ').trim();
       if (!text || isLikelyNonTranslatable(text)) continue;
       units.push({
         __aryaUnit: true,
         kind: 'host',
         host,
-        nodes: ordered,
+        nodes: nodesForUnit,
         text
       });
     }
@@ -2158,36 +2424,138 @@
     }, 3000);
   }
 
+  let measureCanvas = null;
+
+  function measureTextWidth(text, refEl) {
+    const sample = String(text || '');
+    if (!sample) return 0;
+    try {
+      const style = window.getComputedStyle(refEl || document.body);
+      const fontSize = parseFloat(style.fontSize) || 14;
+      const font = `${style.fontStyle || 'normal'} ${style.fontWeight || '400'} ${fontSize * 0.9}px ${style.fontFamily || 'sans-serif'}`;
+      if (!measureCanvas) measureCanvas = document.createElement('canvas');
+      const ctx = measureCanvas.getContext('2d');
+      if (ctx) {
+        ctx.font = font;
+        return ctx.measureText(sample).width;
+      }
+    } catch {
+      // fallback below
+    }
+    const fontSize = 14;
+    let w = 0;
+    for (const ch of sample) {
+      w += /[\u4e00-\u9fff]/.test(ch) ? fontSize * 0.95 : fontSize * 0.55;
+    }
+    return w;
+  }
+
+  function getContentRightEdge(anchor) {
+    try {
+      if (anchor?.nodeType === Node.TEXT_NODE) {
+        const range = document.createRange();
+        range.selectNodeContents(anchor);
+        const rects = [...range.getClientRects()].filter((r) => r.width > 0 || r.height > 0);
+        if (rects.length) return rects[rects.length - 1].right;
+      }
+      const el = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+      if (!el) return 0;
+      return el.getBoundingClientRect().right;
+    } catch {
+      return 0;
+    }
+  }
+
+  function findInlineLayoutContainer(el) {
+    let cur = el;
+    for (let i = 0; i < 8 && cur && cur !== document.body; i++) {
+      try {
+        const st = window.getComputedStyle(cur);
+        if (
+          st.display.includes('flex')
+          || st.display.includes('grid')
+          || st.display === 'block'
+          || st.display === 'inline-block'
+          || cur.tagName === 'TD'
+          || cur.tagName === 'TH'
+          || cur.tagName === 'LI'
+          || cur.tagName === 'P'
+        ) {
+          const w = cur.getBoundingClientRect().width;
+          if (w >= 40) return cur;
+        }
+      } catch {
+        // ignore
+      }
+      cur = cur.parentElement;
+    }
+    return el;
+  }
+
+  function canFitInlineTranslation(anchor, translatedText) {
+    const ref = anchor?.nodeType === Node.ELEMENT_NODE
+      ? anchor
+      : (anchor?.parentElement || document.body);
+    if (!ref || !translatedText) return false;
+
+    const need = measureTextWidth(translatedText, ref) + 14;
+    // 太长的译文横着几乎总会挤爆
+    if (need > Math.min(window.innerWidth * 0.55, 420)) return false;
+
+    const contentRight = getContentRightEdge(anchor);
+    if (!contentRight) return String(translatedText).length <= 18;
+
+    const container = findInlineLayoutContainer(ref);
+    const containerRight = container.getBoundingClientRect().right;
+    const viewportRight = window.innerWidth - 12;
+    const available = Math.min(containerRight, viewportRight) - contentRight;
+    return available >= need;
+  }
+
+  function expandBilingualAncestors(startEl) {
+    let el = startEl?.nodeType === Node.ELEMENT_NODE ? startEl : startEl?.parentElement;
+    if (!el) return;
+
+    for (let i = 0; i < 8 && el && el !== document.documentElement; i++) {
+      if (el === document.body) break;
+      try {
+        const st = window.getComputedStyle(el);
+        const overflowY = st.overflowY || st.overflow;
+        const isScrollPort = (overflowY === 'auto' || overflowY === 'scroll')
+          && el.scrollHeight > el.clientHeight + 24
+          && el.clientHeight > 160;
+        if (isScrollPort && i >= 2) {
+          el.setAttribute('data-arya-expand-scroll', '1');
+          break;
+        }
+        el.setAttribute('data-arya-expand', '1');
+      } catch {
+        el.setAttribute('data-arya-expand', '1');
+      }
+      el = el.parentElement;
+    }
+  }
+
   function resolveBilingualPlacement(nodeOrHost, originalText, translatedText, { forceInline = false } = {}) {
     if (forceInline) return 'inline';
 
-    const el = nodeOrHost?.nodeType === Node.ELEMENT_NODE
-      ? nodeOrHost
-      : nodeOrHost?.parentElement;
-    // 导航 / 顶栏短标签：译文跟在右侧
-    if (el && isCompactTranslationContext(el)) return 'inline';
-    if (el && findInteractiveHost(el) && String(originalText || '').trim().length <= 40) {
-      return 'inline';
-    }
-
+    const anchor = nodeOrHost;
+    const el = anchor?.nodeType === Node.ELEMENT_NODE
+      ? anchor
+      : anchor?.parentElement;
     const src = String(originalText || '').replace(/\s+/g, ' ').trim();
     const dst = String(translatedText || '').replace(/\s+/g, ' ').trim();
-    if (!src || !dst) return 'block';
+    if (!dst) return 'block';
 
-    if (src.length > 48 || dst.length > 48) return 'block';
+    // 明确多行 / 很长的段落：直接下方
     if (/[\n\r]/.test(String(originalText || '')) || /[\n\r]/.test(String(translatedText || ''))) {
       return 'block';
     }
-    if (src.length > 22 && (src.match(/[.!?。！？]/g) || []).length >= 1) return 'block';
+    if (src.length > 90 || dst.length > 90) return 'block';
+    if (src.length > 48 && (src.match(/[.!?。！？]/g) || []).length >= 1) return 'block';
 
-    const parent = el;
-    if (!parent) return src.length <= 24 ? 'inline' : 'block';
-
-    if (/^H[1-6]$/.test(parent.tagName)) {
-      return src.length <= 34 && dst.length <= 30 ? 'inline' : 'block';
-    }
-
-    if (src.length <= 24 && dst.length <= 22) return 'inline';
+    // 优先横着：测一下右侧空间够不够
+    if (canFitInlineTranslation(anchor || el, dst)) return 'inline';
     return 'block';
   }
 
@@ -2200,6 +2568,10 @@
     if (!scope?.querySelectorAll) return;
     scope.querySelectorAll('[data-arya-bilingual-host]').forEach((el) => {
       el.removeAttribute('data-arya-bilingual-host');
+    });
+    scope.querySelectorAll('[data-arya-expand], [data-arya-expand-scroll]').forEach((el) => {
+      el.removeAttribute('data-arya-expand');
+      el.removeAttribute('data-arya-expand-scroll');
     });
   }
 
@@ -2226,6 +2598,10 @@
       removeBilingualElement(node);
     }
 
+    const source = getHostVisibleText(host)
+      || (nodes || []).map((n) => n.textContent || '').join(' ');
+    const placement = resolveBilingualPlacement(host, source, translated);
+
     isApplyingTranslation = true;
     try {
       host.querySelectorAll('.arya-bilingual').forEach((el) => el.remove());
@@ -2236,11 +2612,12 @@
       el.setAttribute('translate', 'no');
       el.setAttribute('data-arya-bilingual', '1');
       el.setAttribute('data-arya-host', '1');
-      el.className = bilingualClassForPlacement('inline');
+      el.className = bilingualClassForPlacement(placement);
       el.textContent = translated;
       host.appendChild(el);
       bilingualElements.set(host, el);
       host.setAttribute('data-arya-bilingual-host', '1');
+      if (placement === 'block') expandBilingualAncestors(host);
     } finally {
       isApplyingTranslation = false;
     }
@@ -2255,11 +2632,12 @@
     }
     removeBlockBilingual(blockEl);
 
-    const sampleNode = nodes[0];
     const joinedOriginal = nodes
       .map((n) => translatedNodes.get(n) ?? n.textContent)
       .join(' ');
-    const placement = resolveBilingualPlacement(blockEl, joinedOriginal, translated);
+    // 用最后一个文本节点测右侧剩余空间更准
+    const measureAnchor = nodes[nodes.length - 1] || blockEl;
+    const placement = resolveBilingualPlacement(measureAnchor, joinedOriginal, translated);
 
     isApplyingTranslation = true;
     try {
@@ -2269,8 +2647,21 @@
       el.setAttribute('data-arya-block', '1');
       el.className = bilingualClassForPlacement(placement);
       el.textContent = translated;
-      blockEl.appendChild(el);
+      if (placement === 'inline' && measureAnchor?.parentNode) {
+        if (measureAnchor.nodeType === Node.TEXT_NODE) {
+          if (measureAnchor.nextSibling) {
+            measureAnchor.parentNode.insertBefore(el, measureAnchor.nextSibling);
+          } else {
+            measureAnchor.parentNode.appendChild(el);
+          }
+        } else {
+          blockEl.appendChild(el);
+        }
+      } else {
+        blockEl.appendChild(el);
+      }
       bilingualElements.set(blockEl, el);
+      if (placement === 'block') expandBilingualAncestors(blockEl);
     } finally {
       isApplyingTranslation = false;
     }
@@ -2314,6 +2705,7 @@
       }
       el.className = bilingualClassForPlacement(placement);
       el.textContent = translated;
+      if (placement === 'block') expandBilingualAncestors(node.parentElement || node);
     } finally {
       isApplyingTranslation = false;
     }
@@ -3064,7 +3456,7 @@
         const totalAttempted = successCount + failedNodeCount + stillMissed;
         showOverlay(`完成！${successCount}/${totalAttempted} 段已翻译${usage}`, 100);
         setTimeout(hideOverlay, 1800);
-        startWatchMode(settings);
+        if (settings.watchMode !== false) startWatchMode(settings);
         const parts = [];
         if (failedNodeCount > 0) parts.push(`${failedNodeCount} 段 API 限流`);
         if (stillMissed > 0) parts.push(`${stillMissed} 段将自动补译`);
@@ -3080,7 +3472,7 @@
 
       showOverlay(`完成！Arya 已翻译 ${successCount} 段${usage}`, 100);
       setTimeout(hideOverlay, 1500);
-      startWatchMode(settings);
+      if (settings.watchMode !== false) startWatchMode(settings);
       return {
         success: true,
         count: successCount,
@@ -3159,22 +3551,30 @@
 
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'sync') return;
-    if (changes.autoTranslate?.newValue) scheduleAutoTranslate();
+    if (changes.autoTranslate?.newValue || changes.siteRules) scheduleAutoTranslate();
     if (
       changes.targetLang
       || changes.showFloatBall
       || changes.showSelectionDot
       || changes.showInputTranslate
       || changes.bilingualMode
+      || changes.siteRules
+      || changes.selectionDelayMs
+      || changes.selectionMinLength
     ) {
       refreshUiWidgets();
       if (changes.targetLang?.newValue) syncFloatBallLangSelect(changes.targetLang.newValue);
-      if (changes.bilingualMode) {
-        const enabled = Boolean(changes.bilingualMode.newValue);
-        uiFeatureFlags.bilingualMode = enabled;
-        if (activeSettings) activeSettings.bilingualMode = enabled;
-        syncFloatBallBilingualToggle(enabled);
-      }
+      getSettings().then((settings) => {
+        if (activeSettings) {
+          activeSettings.bilingualMode = settings.bilingualMode;
+          activeSettings.watchMode = settings.watchMode;
+          activeSettings.skipSelectors = settings.skipSelectors;
+        }
+        uiFeatureFlags.bilingualMode = settings.bilingualMode;
+        uiFeatureFlags.selectionDelayMs = settings.selectionDelayMs;
+        uiFeatureFlags.selectionMinLength = settings.selectionMinLength;
+        syncFloatBallBilingualToggle(settings.bilingualMode);
+      });
     }
   });
 })();

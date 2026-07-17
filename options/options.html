@@ -135,6 +135,36 @@
     .toggle-row label.toggle-text {
       font-weight: 650; margin-bottom: 0; cursor: pointer; color: #9f1239;
     }
+    .inline-fields {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    }
+    @media (max-width: 520px) {
+      .inline-fields { grid-template-columns: 1fr; }
+    }
+    .table-head, .table-row {
+      display: grid; gap: 8px; align-items: center;
+    }
+    .glossary-row { grid-template-columns: 1fr 1fr 36px; margin-bottom: 8px; }
+    .site-rule {
+      border: 1px solid #eef2f7; border-radius: 14px; padding: 14px;
+      background: #f8fafc; margin-bottom: 12px;
+    }
+    .site-rule .tri-row {
+      display: grid; grid-template-columns: 88px 1fr; gap: 8px; align-items: center;
+      margin-bottom: 8px;
+    }
+    .site-rule .tri-row label { margin-bottom: 0; font-weight: 600; font-size: 12px; }
+    .btn-secondary {
+      background: #fff; color: #be123c; border: 1px solid #fecdd3;
+      box-shadow: none; padding: 8px 14px; font-size: 13px;
+    }
+    .btn-secondary:hover { background: #fff1f2; }
+    .btn-icon {
+      padding: 8px; background: #fff; color: #94a3b8; border: 1px solid #e2e8f0;
+      box-shadow: none; border-radius: 10px; line-height: 1;
+    }
+    .btn-icon:hover { color: #e11d48; border-color: #fecdd3; background: #fff1f2; }
+    .list-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   </style>
 </head>
 <body>
@@ -254,6 +284,18 @@
           </div>
         </div>
       </div>
+      <div class="field inline-fields">
+        <div>
+          <label for="selectionDelayMs">粉点出现延迟（毫秒）</label>
+          <input type="number" id="selectionDelayMs" min="0" max="2000" step="20" value="280">
+          <p class="hint">划词后稍等再出点，减少误触。</p>
+        </div>
+        <div>
+          <label for="selectionMinLength">最短选区长度</label>
+          <input type="number" id="selectionMinLength" min="1" max="50" step="1" value="4">
+          <p class="hint">短于该长度不显示粉点。</p>
+        </div>
+      </div>
       <div class="field">
         <div class="toggle-row">
           <input type="checkbox" id="showInputTranslate" checked>
@@ -262,6 +304,35 @@
             <p class="hint" style="margin-top:6px">聚焦输入框时显示「译」按钮，按目标语言智能互译当前内容。</p>
           </div>
         </div>
+      </div>
+      <div class="field">
+        <label>译文缓存</label>
+        <p class="hint" style="margin-bottom:8px">同一段落 + 同一模型 + 同一目标语言会复用本地缓存，刷新页与 Watch 补译也会受益。</p>
+        <button type="button" class="btn-secondary" id="clearCacheBtn">清除译文缓存</button>
+        <span id="clearCacheStatus" class="hint" style="margin-left:10px"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>术语 / 专名表</h2>
+      <p class="hint" style="margin-bottom:12px">固定产品名、人名、UI 文案译法。整段精确匹配直接返回；长句中会约束模型或保护专名。最多 80 条。</p>
+      <div class="glossary-row table-head" style="margin-bottom:6px">
+        <label style="margin:0">原文</label>
+        <label style="margin:0">译文</label>
+        <span></span>
+      </div>
+      <div id="glossaryList"></div>
+      <div class="list-actions">
+        <button type="button" class="btn-secondary" id="addGlossaryBtn">添加术语</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>站点规则</h2>
+      <p class="hint" style="margin-bottom:12px">按域名覆盖全局行为。开关可选「跟随全局 / 开 / 关」。跳过选择器为 CSS，逗号分隔。最多 50 条；更长域名优先匹配。</p>
+      <div id="siteRulesList"></div>
+      <div class="list-actions">
+        <button type="button" class="btn-secondary" id="addSiteRuleBtn">添加站点规则</button>
       </div>
     </div>
 

@@ -45,7 +45,11 @@ const DEFAULT_CONFIG = {
   showFloatBall: true,
   showSelectionDot: true,
   showInputTranslate: true,
-  bilingualMode: false
+  bilingualMode: false,
+  glossary: [],
+  siteRules: [],
+  selectionDelayMs: 280,
+  selectionMinLength: 4
 };
 
 const MT_MAX_CONCURRENT = 4;
@@ -58,6 +62,8 @@ const MT_MAX_INPUT_CHARS = 6000;
 const MT_FETCH_TIMEOUT_MS = 45000;
 const MT_MESSAGE_TIMEOUT_MS = 90000;
 const CACHE_MAX_ENTRIES = 800;
+const GLOSSARY_MAX_ENTRIES = 80;
+const SITE_RULES_MAX_ENTRIES = 50;
 
 const mtSlotQueue = { running: 0, waiters: [] };
 let lastMtRequestAt = 0;
@@ -78,9 +84,61 @@ const MT_TARGET_LANG_MAP = {
   Español: 'Spanish'
 };
 
+function normalizeCacheText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeGlossary(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const from = normalizeCacheText(item?.from ?? item?.source ?? '');
+    const to = String(item?.to ?? item?.target ?? '').trim();
+    if (!from || !to || seen.has(from)) continue;
+    seen.add(from);
+    out.push({ from, to });
+    if (out.length >= GLOSSARY_MAX_ENTRIES) break;
+  }
+  return out;
+}
+
+function normalizeSiteRules(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const host = String(item?.host || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^\*\./, '')
+      .replace(/^https?:\/\//, '')
+      .split('/')[0];
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    const tri = (v) => (v === true || v === false ? v : null);
+    out.push({
+      host,
+      bilingualMode: tri(item?.bilingualMode),
+      watchMode: tri(item?.watchMode),
+      autoTranslate: tri(item?.autoTranslate),
+      skipSelectors: String(item?.skipSelectors || '').trim()
+    });
+    if (out.length >= SITE_RULES_MAX_ENTRIES) break;
+  }
+  return out;
+}
+
 async function getConfig() {
   const stored = await chrome.storage.sync.get(DEFAULT_CONFIG);
-  return { ...DEFAULT_CONFIG, ...stored };
+  return {
+    ...DEFAULT_CONFIG,
+    ...stored,
+    glossary: normalizeGlossary(stored.glossary),
+    siteRules: normalizeSiteRules(stored.siteRules),
+    selectionDelayMs: Math.max(0, Number(stored.selectionDelayMs) || DEFAULT_CONFIG.selectionDelayMs),
+    selectionMinLength: Math.max(1, Number(stored.selectionMinLength) || DEFAULT_CONFIG.selectionMinLength)
+  };
 }
 
 function isMtModel(model) {
@@ -92,16 +150,25 @@ function toMtTargetLang(targetLang) {
 }
 
 function cacheStorageKey(text, targetLang, model) {
-  return `tx:${model}:${targetLang}:${text}`;
+  return `tx:${model}:${targetLang}:${normalizeCacheText(text)}`;
+}
+
+function touchMemCache(key, value) {
+  if (memTranslationCache.has(key)) memTranslationCache.delete(key);
+  memTranslationCache.set(key, value);
 }
 
 async function getCachedTranslation(text, targetLang, model) {
   const key = cacheStorageKey(text, targetLang, model);
-  if (memTranslationCache.has(key)) return memTranslationCache.get(key);
+  if (memTranslationCache.has(key)) {
+    const value = memTranslationCache.get(key);
+    touchMemCache(key, value);
+    return value;
+  }
   try {
     const stored = await chrome.storage.local.get(key);
     if (stored[key]) {
-      memTranslationCache.set(key, stored[key]);
+      touchMemCache(key, stored[key]);
       return stored[key];
     }
   } catch {
@@ -111,17 +178,76 @@ async function getCachedTranslation(text, targetLang, model) {
 }
 
 async function setCachedTranslation(text, targetLang, model, translation) {
-  const key = cacheStorageKey(text, targetLang, model);
-  memTranslationCache.set(key, translation);
+  const source = normalizeCacheText(text);
+  const translated = String(translation || '').trim();
+  if (!source || !translated) return;
+  if (normalizeCacheText(translated) === source) return;
+
+  const key = cacheStorageKey(source, targetLang, model);
+  touchMemCache(key, translated);
   try {
-    await chrome.storage.local.set({ [key]: translation });
-    if (memTranslationCache.size > CACHE_MAX_ENTRIES) {
+    await chrome.storage.local.set({ [key]: translated });
+    while (memTranslationCache.size > CACHE_MAX_ENTRIES) {
       const firstKey = memTranslationCache.keys().next().value;
       memTranslationCache.delete(firstKey);
+      try {
+        await chrome.storage.local.remove(firstKey);
+      } catch {
+        // ignore
+      }
     }
   } catch {
     // ignore quota errors
   }
+}
+
+async function clearTranslationCache() {
+  memTranslationCache.clear();
+  let removed = 0;
+  try {
+    const all = await chrome.storage.local.get(null);
+    const keys = Object.keys(all || {}).filter((k) => k.startsWith('tx:'));
+    removed = keys.length;
+    if (keys.length) await chrome.storage.local.remove(keys);
+  } catch {
+    // ignore
+  }
+  return removed;
+}
+
+function formatGlossaryPromptBlock(glossary) {
+  if (!glossary?.length) return '';
+  const lines = glossary.map((g) => `- ${g.from} → ${g.to}`).join('\n');
+  return `\n术语表（必须遵守，专名按表翻译）：\n${lines}\n`;
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function protectGlossaryTerms(text, glossary) {
+  if (!glossary?.length) return { text, tokens: [] };
+  const tokens = [];
+  let protectedText = String(text);
+  const sorted = [...glossary].sort((a, b) => b.from.length - a.from.length);
+  for (const g of sorted) {
+    if (!g.from) continue;
+    const re = new RegExp(escapeRegExp(g.from), 'g');
+    protectedText = protectedText.replace(re, () => {
+      const idx = tokens.length;
+      tokens.push(g.to);
+      return `⟦G${idx}⟧`;
+    });
+  }
+  return { text: protectedText, tokens };
+}
+
+function restoreGlossaryTokens(text, tokens) {
+  if (!tokens?.length) return text;
+  return String(text || '').replace(/⟦G(\d+)⟧/g, (match, n) => {
+    const i = Number(n);
+    return tokens[i] != null ? tokens[i] : match;
+  });
 }
 
 function rotateBailianApiKey() {
@@ -205,7 +331,7 @@ async function waitForMtRateLimit() {
 }
 
 function sanitizeMtSegment(text) {
-  return text.replace(/\s+/g, ' ').trim();
+  return normalizeCacheText(text);
 }
 
 function joinMtSegments(texts) {
@@ -313,8 +439,9 @@ function splitLongText(text, maxChars = MT_MAX_INPUT_CHARS) {
   return parts.filter(Boolean);
 }
 
-function buildTranslationPrompt(text, targetLang) {
-  return `将以下文本翻译成${targetLang}，只返回译文，不要解释：\n${text}`;
+function buildTranslationPrompt(text, targetLang, glossary = []) {
+  const gloss = formatGlossaryPromptBlock(glossary);
+  return `将以下文本翻译成${targetLang}，只返回译文，不要解释：${gloss}\n${text}`;
 }
 
 function extractJsonArray(content) {
@@ -378,15 +505,16 @@ function parseBatchTranslations(content, expectedLength) {
   throw err;
 }
 
-function buildBatchMessages(texts, targetLang) {
+function buildBatchMessages(texts, targetLang, glossary = []) {
   const items = texts.map((t, i) => ({ i, t }));
+  const gloss = formatGlossaryPromptBlock(glossary);
   return [
     {
       role: 'user',
       content:
         '你是翻译助手。只输出 JSON 数组，不要任何解释。' +
         '每项格式为 {"i":序号,"t":译文}，序号必须与输入一致，不得遗漏、合并或跳过。\n' +
-        `将下列 JSON 中每项的 t 字段翻译成${targetLang}。` +
+        `将下列 JSON 中每项的 t 字段翻译成${targetLang}。${gloss}` +
         `必须返回恰好 ${texts.length} 项，格式 [{"i":0,"t":"..."},...]：\n${JSON.stringify(items)}`
     }
   ];
@@ -564,8 +692,8 @@ async function callTranslateAPI(texts, config, requestId, streamCallback = null)
       body: JSON.stringify({
         model: modelId,
         messages: isSingle
-          ? [{ role: 'user', content: buildTranslationPrompt(texts[0], config.targetLang) }]
-          : buildBatchMessages(texts, config.targetLang),
+          ? [{ role: 'user', content: buildTranslationPrompt(texts[0], config.targetLang, config.glossary || []) }]
+          : buildBatchMessages(texts, config.targetLang, config.glossary || []),
         temperature: 0.1,
         ...api.extra
       })
@@ -624,18 +752,38 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   if (!texts.length) return [];
 
   const modelId = (config.model || '').trim();
+  const glossary = normalizeGlossary(config.glossary);
+  const exactMap = new Map(glossary.map((g) => [g.from, g.to]));
   const results = new Array(texts.length);
   const needIndices = [];
   const needTexts = [];
+  const needTokenSets = [];
 
   for (let i = 0; i < texts.length; i++) {
-    const cached = await getCachedTranslation(texts[i], config.targetLang, modelId);
+    const source = texts[i];
+    const normalized = normalizeCacheText(source);
+    const exact = exactMap.get(normalized);
+    if (exact != null) {
+      results[i] = exact;
+      if (streamCallback) streamCallback([{ index: i, text: exact, cached: true }]);
+      await setCachedTranslation(source, config.targetLang, modelId, exact);
+      continue;
+    }
+
+    const cached = await getCachedTranslation(source, config.targetLang, modelId);
     if (cached != null) {
       results[i] = cached;
       if (streamCallback) streamCallback([{ index: i, text: cached, cached: true }]);
     } else {
       needIndices.push(i);
-      needTexts.push(texts[i]);
+      if (isMtModel(modelId) && glossary.length) {
+        const protectedItem = protectGlossaryTerms(source, glossary);
+        needTexts.push(protectedItem.text);
+        needTokenSets.push(protectedItem.tokens);
+      } else {
+        needTexts.push(source);
+        needTokenSets.push([]);
+      }
     }
   }
 
@@ -644,11 +792,14 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   const mapStream = streamCallback
     ? (updates) => {
         streamCallback(
-          updates.map((u) => ({
-            index: needIndices[u.index],
-            text: u.text,
-            cached: false
-          }))
+          updates.map((u) => {
+            const tokens = needTokenSets[u.index] || [];
+            return {
+              index: needIndices[u.index],
+              text: restoreGlossaryTokens(u.text, tokens),
+              cached: false
+            };
+          })
         );
       }
     : null;
@@ -700,10 +851,9 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   }
 
   for (let j = 0; j < needTexts.length; j++) {
-    results[needIndices[j]] = apiResults[j];
-    if (isMtModel(modelId)) {
-      await setCachedTranslation(needTexts[j], config.targetLang, modelId, apiResults[j]);
-    }
+    const restored = restoreGlossaryTokens(apiResults[j], needTokenSets[j] || []);
+    results[needIndices[j]] = restored;
+    await setCachedTranslation(texts[needIndices[j]], config.targetLang, modelId, restored);
   }
   return results;
 }
@@ -1021,6 +1171,13 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'ping') {
     sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.action === 'clearTranslationCache') {
+    clearTranslationCache()
+      .then((removed) => sendResponse({ success: true, removed }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 
