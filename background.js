@@ -46,6 +46,7 @@ const DEFAULT_CONFIG = {
   showSelectionDot: true,
   showInputTranslate: true,
   bilingualMode: false,
+  translationTheme: 'underline',
   glossary: [],
   siteRules: [],
   selectionDelayMs: 280,

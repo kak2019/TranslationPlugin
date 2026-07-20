@@ -267,6 +267,16 @@
         </div>
       </div>
       <div class="field">
+        <label for="translationTheme">双语译文样式</label>
+        <select id="translationTheme">
+          <option value="none">无装饰</option>
+          <option value="underline">下划线（推荐）</option>
+          <option value="weakening">弱化（半透明）</option>
+          <option value="blockquote">引用条</option>
+        </select>
+        <p class="hint">对齐沉浸式翻译的双语注入风格；切换后需重新翻译页面才会套用到已有译文。</p>
+      </div>
+      <div class="field">
         <div class="toggle-row">
           <input type="checkbox" id="showFloatBall" checked>
           <div>
@@ -387,7 +397,7 @@
         Arya 以我女朋友的名字命名。❤️<br>
         希望它帮你更好地阅读这个世界。
       </p>
-      <p class="arya-version-note">v2.2.5 — 增加悬浮查看原文，并可一键还原该段译文。</p>
+      <p class="arya-version-note">v2.3.0 — 译文缓存、术语表、站点规则与双语布局打磨。</p>
     </div>
   </div>
   <script src="../shared/models.js"></script>

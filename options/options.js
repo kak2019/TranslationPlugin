@@ -19,6 +19,7 @@ const batchSizeSelect = document.getElementById('batchSize');
 const concurrencySelect = document.getElementById('concurrency');
 const autoTranslateInput = document.getElementById('autoTranslate');
 const bilingualModeInput = document.getElementById('bilingualMode');
+const translationThemeSelect = document.getElementById('translationTheme');
 const showFloatBallInput = document.getElementById('showFloatBall');
 const showSelectionDotInput = document.getElementById('showSelectionDot');
 const showInputTranslateInput = document.getElementById('showInputTranslate');
@@ -202,6 +203,7 @@ async function loadSettings() {
     showSelectionDot: true,
     showInputTranslate: true,
     bilingualMode: false,
+    translationTheme: 'underline',
     glossary: [],
     siteRules: [],
     selectionDelayMs: 280,
@@ -218,6 +220,10 @@ async function loadSettings() {
   concurrencySelect.value = String(stored.concurrency);
   autoTranslateInput.checked = Boolean(stored.autoTranslate);
   bilingualModeInput.checked = Boolean(stored.bilingualMode);
+  const themes = new Set(['none', 'underline', 'weakening', 'blockquote']);
+  translationThemeSelect.value = themes.has(stored.translationTheme)
+    ? stored.translationTheme
+    : 'underline';
   showFloatBallInput.checked = stored.showFloatBall !== false;
   showSelectionDotInput.checked = stored.showSelectionDot !== false;
   showInputTranslateInput.checked = stored.showInputTranslate !== false;
@@ -287,6 +293,10 @@ saveBtn.addEventListener('click', async () => {
   const concurrency = Number(concurrencySelect.value);
   const autoTranslate = autoTranslateInput.checked;
   const bilingualMode = bilingualModeInput.checked;
+  const themes = new Set(['none', 'underline', 'weakening', 'blockquote']);
+  const translationTheme = themes.has(translationThemeSelect.value)
+    ? translationThemeSelect.value
+    : 'underline';
   const showFloatBall = showFloatBallInput.checked;
   const showSelectionDot = showSelectionDotInput.checked;
   const showInputTranslate = showInputTranslateInput.checked;
@@ -306,6 +316,7 @@ saveBtn.addEventListener('click', async () => {
     concurrency,
     autoTranslate,
     bilingualMode,
+    translationTheme,
     showFloatBall,
     showSelectionDot,
     showInputTranslate,

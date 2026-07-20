@@ -86,8 +86,10 @@
     showInputTranslate: true,
     bilingualMode: false,
     selectionDelayMs: 280,
-    selectionMinLength: 4
+    selectionMinLength: 4,
+    translationTheme: 'underline'
   };
+  const TRANSLATION_THEMES = new Set(['none', 'underline', 'weakening', 'blockquote']);
   let activeSkipSelectors = [];
   const bilingualElements = new WeakMap();
   let pageTranslationActive = false;
@@ -141,6 +143,23 @@
   function parseSkipSelectors(str) {
     if (!str || typeof str !== 'string') return [];
     return str.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  // 营销站常见「演示区 / 导航」跳过；与用户 siteRules.skipSelectors 合并
+  const BUILTIN_SKIP_BY_HOST = {
+    'cursor.com':
+      'nav, header, footer, [role="navigation"], [role="banner"], [role="menubar"], [aria-hidden="true"]'
+  };
+
+  function getBuiltinSkipSelectors(hostname) {
+    const host = String(hostname || '').toLowerCase();
+    if (!host) return [];
+    for (const [key, selectors] of Object.entries(BUILTIN_SKIP_BY_HOST)) {
+      if (host === key || host.endsWith(`.${key}`)) {
+        return parseSkipSelectors(selectors);
+      }
+    }
+    return [];
   }
 
   function applySiteRuleToSettings(settings, rule) {
@@ -909,17 +928,172 @@
     return Boolean(uiFeatureFlags.bilingualMode);
   }
 
+  function getTranslationTheme() {
+    const raw = activeSettings?.translationTheme || uiFeatureFlags.translationTheme || 'underline';
+    return TRANSLATION_THEMES.has(raw) ? raw : 'underline';
+  }
+
+  function setAryaDualState(on) {
+    if (on) document.documentElement.setAttribute('data-arya-state', 'dual');
+    else document.documentElement.removeAttribute('data-arya-state');
+  }
+
+  function isBilingualBreak(el) {
+    return Boolean(
+      el?.nodeType === Node.ELEMENT_NODE
+      && (el.classList?.contains('arya-bilingual-break') || el.getAttribute?.('data-arya-bilingual-break') === '1')
+    );
+  }
+
+  function isBilingualSpacerText(node) {
+    return node?.nodeType === Node.TEXT_NODE
+      && Boolean(node.textContent)
+      && !node.textContent.replace(/[\u00A0\s]/g, '');
+  }
+
+  function removeBilingualArtifactsBefore(el) {
+    if (!el) return;
+    let prev = el.previousSibling;
+    while (prev) {
+      if (isBilingualBreak(prev) || isBilingualSpacerText(prev)) {
+        const toRemove = prev;
+        prev = prev.previousSibling;
+        toRemove.remove();
+        continue;
+      }
+      break;
+    }
+  }
+
+  function createBilingualElement(translated, placement, extras = {}) {
+    ensureOverlayStyles();
+    setAryaDualState(true);
+    const theme = getTranslationTheme();
+    const place = placement === 'inline' ? 'inline' : 'block';
+    const wrapper = document.createElement('span');
+    wrapper.className = [
+      'notranslate',
+      'arya-bilingual',
+      'arya-bilingual-wrapper',
+      `arya-bilingual-${place}`,
+      `arya-bilingual-theme-${theme}`,
+      `arya-bilingual-${place}-theme-${theme}`
+    ].join(' ');
+    wrapper.setAttribute('translate', 'no');
+    wrapper.setAttribute('data-arya-bilingual', '1');
+    if (extras.host) wrapper.setAttribute('data-arya-host', '1');
+    if (extras.block) wrapper.setAttribute('data-arya-block', '1');
+    const targetLang = activeSettings?.targetLang || '';
+    const lang = SPEECH_LANG_MAP[targetLang];
+    if (lang) wrapper.setAttribute('lang', lang);
+
+    const inner = document.createElement('span');
+    inner.className = `notranslate arya-bilingual-inner arya-bilingual-theme-${theme}-inner`;
+    inner.setAttribute('translate', 'no');
+    inner.setAttribute('data-arya-bilingual-inner', '1');
+    inner.textContent = translated;
+    wrapper.appendChild(inner);
+    return wrapper;
+  }
+
+  function isFragileInsertParent(parent) {
+    if (!parent || parent.nodeType !== Node.ELEMENT_NODE) return false;
+    if (/^(A|BUTTON|SUMMARY|LABEL|H1|H2|H3|H4|H5|H6)$/i.test(parent.tagName)) return true;
+    try {
+      const st = window.getComputedStyle(parent);
+      const display = st.display || '';
+      if (display.includes('flex') || display.includes('grid')) return true;
+      if (st.position === 'absolute' || st.position === 'fixed') return true;
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+
+  function findSafeBilingualMount(referenceNode) {
+    let after = referenceNode?.nodeType === Node.ELEMENT_NODE
+      ? referenceNode
+      : referenceNode?.parentElement;
+    if (!after) {
+      return { parent: document.body, after: null };
+    }
+    for (let i = 0; i < 8 && after && after !== document.body; i++) {
+      const parent = after.parentElement;
+      if (!parent || parent === document.documentElement) break;
+      if (!isFragileInsertParent(parent)) {
+        return { parent, after };
+      }
+      after = parent;
+    }
+    const parent = after?.parentElement || document.body;
+    return { parent, after: after || null };
+  }
+
+  function insertBilingualAfter(parent, referenceNode, el, placement) {
+    if (!parent || !el) return;
+    const frag = document.createDocumentFragment();
+    const fragile = isFragileInsertParent(parent);
+    if (placement === 'block') {
+      if (!fragile) {
+        const br = document.createElement('br');
+        br.className = 'arya-bilingual-break';
+        br.setAttribute('data-arya-bilingual-break', '1');
+        frag.appendChild(br);
+      } else {
+        // flex/grid/按钮内禁止 <br>，改用整行块级，避免撑乱
+        el.classList.add('arya-bilingual-block-soft');
+      }
+    } else {
+      frag.appendChild(document.createTextNode('\u00A0\u00A0'));
+    }
+    frag.appendChild(el);
+    if (referenceNode && referenceNode.parentNode === parent) {
+      if (referenceNode.nextSibling) parent.insertBefore(frag, referenceNode.nextSibling);
+      else parent.appendChild(frag);
+    } else {
+      parent.appendChild(frag);
+    }
+  }
+
+  /** 块级译文：必要时上移到非 flex/grid 父级再插入 */
+  function mountBilingualNear(referenceNode, el, placement) {
+    let parent = referenceNode?.parentNode;
+    let after = referenceNode;
+    if (placement === 'block' && (!parent || isFragileInsertParent(parent))) {
+      const safe = findSafeBilingualMount(referenceNode);
+      parent = safe.parent;
+      after = safe.after;
+    }
+    if (!parent) parent = document.body;
+    insertBilingualAfter(parent, after, el, placement);
+    return { parent, after };
+  }
+
   function findBilingualElement(node) {
     const cached = bilingualElements.get(node);
     if (cached?.isConnected) return cached;
     let sib = node?.nextSibling;
     while (sib) {
-      if (sib.nodeType === Node.ELEMENT_NODE && sib.classList?.contains('arya-bilingual')) {
-        bilingualElements.set(node, sib);
-        return sib;
+      if (sib.nodeType === Node.ELEMENT_NODE) {
+        if (isBilingualBreak(sib)) {
+          sib = sib.nextSibling;
+          continue;
+        }
+        if (sib.classList?.contains('arya-bilingual')) {
+          bilingualElements.set(node, sib);
+          return sib;
+        }
+        return null;
       }
-      if (sib.nodeType === Node.TEXT_NODE && sib.textContent.trim()) return null;
-      if (sib.nodeType === Node.ELEMENT_NODE) return null;
+      if (sib.nodeType === Node.TEXT_NODE) {
+        if (isBilingualSpacerText(sib)) {
+          sib = sib.nextSibling;
+          continue;
+        }
+        if (sib.textContent.trim()) return null;
+        sib = sib.nextSibling;
+        continue;
+      }
       sib = sib.nextSibling;
     }
     return null;
@@ -930,6 +1104,7 @@
     if (!el) return;
     isApplyingTranslation = true;
     try {
+      removeBilingualArtifactsBefore(el);
       el.remove();
     } finally {
       isApplyingTranslation = false;
@@ -1217,7 +1392,7 @@
   }
 
   function ensureOverlayStyles() {
-    const STYLE_VERSION = '11';
+    const STYLE_VERSION = '14';
     let style = document.getElementById('bailian-translate-styles');
     if (style?.dataset?.version === STYLE_VERSION) return;
     if (!style) {
@@ -1405,58 +1580,97 @@
       #arya-float-ball .arya-fb-toggle span {
         font-size: 12px; font-weight: 600; color: #be123c;
       }
-      .arya-bilingual {
-        color: inherit !important;
-        font-weight: inherit !important;
+      :root {
+        --arya-theme-underline: #fb7185;
+        --arya-theme-blockquote: #f43f5e;
+      }
+      .arya-bilingual-break {
+        display: block !important;
+        content: "" !important;
+      }
+      .arya-bilingual-wrapper {
+        font-feature-settings: normal !important;
+        max-width: 100% !important;
+        min-width: 0 !important;
+        box-sizing: border-box !important;
+        overflow-wrap: anywhere !important;
         word-break: break-word !important;
       }
-      .arya-bilingual.arya-bilingual-inline {
-        display: inline !important;
-        margin: 0 0 0 0.35em !important;
-        padding: 0 !important;
-        border-left: none !important;
-        opacity: 0.75 !important;
-        font-size: 0.9em !important;
+      .arya-bilingual-inner {
+        color: inherit !important;
+        font: inherit !important;
+        font-size: inherit !important;
+        font-weight: inherit !important;
         line-height: inherit !important;
-        white-space: normal !important;
-        vertical-align: baseline !important;
-        font-weight: 500 !important;
+        word-break: break-word !important;
+        overflow-wrap: anywhere !important;
+        max-width: 100% !important;
       }
-      .arya-bilingual.arya-bilingual-block {
+      [data-arya-state="dual"] .arya-bilingual-inline {
+        display: inline !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+        vertical-align: baseline !important;
+        white-space: normal !important;
+        max-width: 100% !important;
+      }
+      [data-arya-state="dual"] .arya-bilingual-block {
         display: block !important;
-        position: relative !important;
-        z-index: 1 !important;
-        clear: both !important;
-        float: none !important;
+        margin: 8px 0 !important;
+        padding: 0 !important;
+        border: none !important;
         width: auto !important;
         max-width: 100% !important;
+        min-width: 0 !important;
         box-sizing: border-box !important;
-        margin: 0.2em 0 0.45em !important;
-        padding: 0.12em 0 0.12em 0.65em !important;
-        border-left: 2.5px solid #c4b5fd !important;
-        opacity: 0.9 !important;
-        font-size: 0.95em !important;
-        line-height: 1.55 !important;
-        white-space: pre-wrap !important;
-        background: transparent !important;
-        pointer-events: none !important;
+        white-space: normal !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+      }
+      [data-arya-state="dual"] .arya-bilingual-block.arya-bilingual-block-soft {
+        display: block !important;
+        margin: 6px 0 0 !important;
+        width: auto !important;
+        max-width: 100% !important;
+      }
+      [data-arya-state="dual"] .arya-bilingual-theme-underline-inner {
+        border-bottom: 1px solid var(--arya-theme-underline) !important;
+      }
+      [data-arya-state="dual"] .arya-bilingual-theme-weakening,
+      [data-arya-state="dual"] .arya-bilingual-theme-weakening-inner {
+        opacity: 0.618 !important;
+      }
+      [data-arya-state="dual"] .arya-bilingual-block-theme-blockquote {
+        border-left: 4px solid var(--arya-theme-blockquote) !important;
+        padding-left: 12px !important;
+        display: block !important;
+        max-width: 100% !important;
+        box-sizing: border-box !important;
       }
       [data-arya-expand="1"] {
         height: auto !important;
         max-height: none !important;
         min-height: 0 !important;
-        overflow: visible !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        overflow-x: clip !important;
+        overflow-y: visible !important;
         -webkit-line-clamp: unset !important;
         line-clamp: unset !important;
         text-overflow: clip !important;
         white-space: normal !important;
-        flex-shrink: 0 !important;
       }
       [data-arya-expand-scroll="1"] {
         height: auto !important;
         max-height: none !important;
+        min-width: 0 !important;
         -webkit-line-clamp: unset !important;
         line-clamp: unset !important;
+      }
+      /* 双栏文档站：避免译文把整页撑出横向滚动条 */
+      [data-arya-state="dual"] body {
+        overflow-x: clip !important;
       }
       #arya-input-fab {
         position: fixed; z-index: 2147483644; display: none;
@@ -1587,17 +1801,22 @@
           bilingualMode: false,
           siteRules: [],
           selectionDelayMs: 280,
-          selectionMinLength: 4
+          selectionMinLength: 4,
+          translationTheme: 'underline'
         },
         (stored) => {
           const isMt = stored.model?.trim().toLowerCase().startsWith('qwen-mt');
+          const theme = TRANSLATION_THEMES.has(stored.translationTheme)
+            ? stored.translationTheme
+            : 'underline';
           uiFeatureFlags = {
             showFloatBall: stored.showFloatBall !== false,
             showSelectionDot: stored.showSelectionDot !== false,
             showInputTranslate: stored.showInputTranslate !== false,
             bilingualMode: Boolean(stored.bilingualMode),
             selectionDelayMs: Math.max(0, Number(stored.selectionDelayMs) || 280),
-            selectionMinLength: Math.max(1, Number(stored.selectionMinLength) || 4)
+            selectionMinLength: Math.max(1, Number(stored.selectionMinLength) || 4),
+            translationTheme: theme
           };
           let settings = {
             batchSize: Number(stored.batchSize) || 40,
@@ -1610,6 +1829,7 @@
             bilingualMode: uiFeatureFlags.bilingualMode,
             selectionDelayMs: uiFeatureFlags.selectionDelayMs,
             selectionMinLength: uiFeatureFlags.selectionMinLength,
+            translationTheme: theme,
             watchMode: null,
             skipSelectors: '',
             siteRule: null,
@@ -1617,7 +1837,9 @@
           };
           const rule = matchSiteRule(location.hostname, normalizeSiteRules(stored.siteRules));
           settings = applySiteRuleToSettings(settings, rule);
-          activeSkipSelectors = parseSkipSelectors(settings.skipSelectors);
+          const builtinSkip = getBuiltinSkipSelectors(location.hostname);
+          const userSkip = parseSkipSelectors(settings.skipSelectors);
+          activeSkipSelectors = [...new Set([...builtinSkip, ...userSkip])];
           if (settings.bilingualMode !== uiFeatureFlags.bilingualMode) {
             uiFeatureFlags.bilingualMode = settings.bilingualMode;
           }
@@ -1977,7 +2199,30 @@
     if (!el) return false;
     return Boolean(
       el.closest(
-        'nav, aside, header, footer, [role="navigation"], [role="menubar"], [role="menu"], [role="tablist"], [role="toolbar"], [role="banner"]'
+        [
+          'nav',
+          'aside',
+          'header',
+          'footer',
+          '[role="navigation"]',
+          '[role="menubar"]',
+          '[role="menu"]',
+          '[role="tablist"]',
+          '[role="toolbar"]',
+          '[role="banner"]',
+          '[role="complementary"]',
+          '[role="directory"]',
+          '.table-of-contents',
+          '.toc',
+          '#toc',
+          '[class*="table-of-contents" i]',
+          '[class*="TableOfContents"]',
+          '[class*="on-this-page" i]',
+          '[class*="OnThisPage"]',
+          '[class*="SideNav"]',
+          '[class*="DocsSidebar"]',
+          '[data-testid*="toc" i]'
+        ].join(', ')
       )
     );
   }
@@ -2516,11 +2761,29 @@
     let el = startEl?.nodeType === Node.ELEMENT_NODE ? startEl : startEl?.parentElement;
     if (!el) return;
 
-    for (let i = 0; i < 8 && el && el !== document.documentElement; i++) {
+    for (let i = 0; i < 5 && el && el !== document.documentElement; i++) {
       if (el === document.body) break;
+      // 导航 / sticky 头不撑开
+      if (isCompactTranslationContext(el)) break;
       try {
         const st = window.getComputedStyle(el);
+        if (st.position === 'sticky' || st.position === 'fixed') break;
+        if (st.position === 'absolute') {
+          el = el.parentElement;
+          continue;
+        }
+
         const overflowY = st.overflowY || st.overflow;
+        const overflowX = st.overflowX || st.overflow;
+        // 演示卡片 / 裁切容器：不要强行 overflow:visible
+        if (overflowY === 'hidden' || overflowX === 'hidden') {
+          const hasFixedBox = st.height !== 'auto' || (st.maxHeight && st.maxHeight !== 'none');
+          if (hasFixedBox || st.borderRadius !== '0px') {
+            el = el.parentElement;
+            continue;
+          }
+        }
+
         const isScrollPort = (overflowY === 'auto' || overflowY === 'scroll')
           && el.scrollHeight > el.clientHeight + 24
           && el.clientHeight > 160;
@@ -2530,10 +2793,31 @@
         }
         el.setAttribute('data-arya-expand', '1');
       } catch {
-        el.setAttribute('data-arya-expand', '1');
+        // ignore expand on this node
       }
       el = el.parentElement;
     }
+  }
+
+  function shouldSkipBilingualUi(el, text) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!t) return true;
+    // 侧栏 / TOC / 导航：双语会撑宽窄栏导致横向滚动，整区跳过
+    if (isCompactTranslationContext(el)) return true;
+    if (el?.closest?.('[role="menuitem"], [role="tab"], [role="toolbar"]') && t.length <= 28) {
+      return true;
+    }
+    // 过窄容器（如右侧目录残留节点）也不挂双语
+    try {
+      const box = el?.nodeType === Node.ELEMENT_NODE ? el : el?.parentElement;
+      if (box) {
+        const w = box.getBoundingClientRect().width;
+        if (w > 0 && w < 220 && t.length > 12) return true;
+      }
+    } catch {
+      // ignore
+    }
+    return false;
   }
 
   function resolveBilingualPlacement(nodeOrHost, originalText, translatedText, { forceInline = false } = {}) {
@@ -2554,14 +2838,17 @@
     if (src.length > 90 || dst.length > 90) return 'block';
     if (src.length > 48 && (src.match(/[.!?。！？]/g) || []).length >= 1) return 'block';
 
+    // 交互控件 / flex 行内：横排极易挤按钮，强制下方
+    const host = el && (el.matches?.('a, button, summary, [role="link"], [role="button"]')
+      ? el
+      : findInteractiveHost(el));
+    if (host || (el && isFragileInsertParent(el))) {
+      return 'block';
+    }
+
     // 优先横着：测一下右侧空间够不够
     if (canFitInlineTranslation(anchor || el, dst)) return 'inline';
     return 'block';
-  }
-
-  function bilingualClassForPlacement(placement) {
-    if (placement === 'inline') return 'arya-bilingual arya-bilingual-inline';
-    return 'arya-bilingual arya-bilingual-block';
   }
 
   function clearBilingualHosts(scope) {
@@ -2580,8 +2867,15 @@
     const cached = bilingualElements.get(blockEl);
     isApplyingTranslation = true;
     try {
-      if (cached?.isConnected) cached.remove();
+      if (cached?.isConnected) {
+        removeBilingualArtifactsBefore(cached);
+        cached.remove();
+      }
       blockEl.querySelectorAll(':scope > .arya-bilingual[data-arya-block="1"]').forEach((el) => {
+        removeBilingualArtifactsBefore(el);
+        el.remove();
+      });
+      blockEl.querySelectorAll(':scope > .arya-bilingual-break, :scope > [data-arya-bilingual-break="1"]').forEach((el) => {
         el.remove();
       });
     } finally {
@@ -2600,24 +2894,49 @@
 
     const source = getHostVisibleText(host)
       || (nodes || []).map((n) => n.textContent || '').join(' ');
-    const placement = resolveBilingualPlacement(host, source, translated);
+
+    // 导航短文案：跳过双语，避免 CTA/菜单被撑开
+    if (shouldSkipBilingualUi(host, source)) return;
+
+    // 永远挂在 host 外侧 sibling，不塞进 a/button 内部
+    let placement = resolveBilingualPlacement(host, source, translated);
+    if (placement === 'inline') placement = 'block';
 
     isApplyingTranslation = true;
     try {
-      host.querySelectorAll('.arya-bilingual').forEach((el) => el.remove());
+      host.querySelectorAll('.arya-bilingual').forEach((el) => {
+        removeBilingualArtifactsBefore(el);
+        el.remove();
+      });
+      host.querySelectorAll('.arya-bilingual-break, [data-arya-bilingual-break="1"]').forEach((el) => {
+        el.remove();
+      });
       const cached = bilingualElements.get(host);
-      if (cached?.isConnected) cached.remove();
+      if (cached?.isConnected) {
+        removeBilingualArtifactsBefore(cached);
+        cached.remove();
+      }
+      // 清掉此前挂在 host 后面的译文
+      let sib = host.nextSibling;
+      while (sib) {
+        const next = sib.nextSibling;
+        if (isBilingualBreak(sib) || isBilingualSpacerText(sib)) {
+          sib.remove();
+          sib = next;
+          continue;
+        }
+        if (sib.nodeType === Node.ELEMENT_NODE && sib.classList?.contains('arya-bilingual')) {
+          sib.remove();
+          break;
+        }
+        break;
+      }
 
-      const el = document.createElement('span');
-      el.setAttribute('translate', 'no');
-      el.setAttribute('data-arya-bilingual', '1');
-      el.setAttribute('data-arya-host', '1');
-      el.className = bilingualClassForPlacement(placement);
-      el.textContent = translated;
-      host.appendChild(el);
+      const el = createBilingualElement(translated, placement, { host: true });
+      const mounted = mountBilingualNear(host, el, placement);
       bilingualElements.set(host, el);
       host.setAttribute('data-arya-bilingual-host', '1');
-      if (placement === 'block') expandBilingualAncestors(host);
+      if (placement === 'block') expandBilingualAncestors(mounted.parent);
     } finally {
       isApplyingTranslation = false;
     }
@@ -2635,33 +2954,26 @@
     const joinedOriginal = nodes
       .map((n) => translatedNodes.get(n) ?? n.textContent)
       .join(' ');
+    if (shouldSkipBilingualUi(blockEl, joinedOriginal)) return;
+
     // 用最后一个文本节点测右侧剩余空间更准
     const measureAnchor = nodes[nodes.length - 1] || blockEl;
     const placement = resolveBilingualPlacement(measureAnchor, joinedOriginal, translated);
 
     isApplyingTranslation = true;
     try {
-      const el = document.createElement('span');
-      el.setAttribute('translate', 'no');
-      el.setAttribute('data-arya-bilingual', '1');
-      el.setAttribute('data-arya-block', '1');
-      el.className = bilingualClassForPlacement(placement);
-      el.textContent = translated;
-      if (placement === 'inline' && measureAnchor?.parentNode) {
-        if (measureAnchor.nodeType === Node.TEXT_NODE) {
-          if (measureAnchor.nextSibling) {
-            measureAnchor.parentNode.insertBefore(el, measureAnchor.nextSibling);
-          } else {
-            measureAnchor.parentNode.appendChild(el);
-          }
-        } else {
-          blockEl.appendChild(el);
-        }
+      const el = createBilingualElement(translated, placement, { block: true });
+      let mounted;
+      if (placement === 'inline' && measureAnchor?.parentNode && !isFragileInsertParent(measureAnchor.parentNode)) {
+        insertBilingualAfter(measureAnchor.parentNode, measureAnchor, el, placement);
+        mounted = { parent: measureAnchor.parentNode };
       } else {
-        blockEl.appendChild(el);
+        mounted = mountBilingualNear(blockEl.lastChild || blockEl, el, placement === 'inline' ? 'block' : placement);
       }
       bilingualElements.set(blockEl, el);
-      if (placement === 'block') expandBilingualAncestors(blockEl);
+      if (el.classList.contains('arya-bilingual-block')) {
+        expandBilingualAncestors(mounted?.parent || blockEl);
+      }
     } finally {
       isApplyingTranslation = false;
     }
@@ -2674,6 +2986,11 @@
     const host = findInteractiveHost(node);
     if (host && bilingualElements.get(host)?.isConnected) {
       if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
+      return;
+    }
+    // 交互控件改走 host 外侧挂载
+    if (host) {
+      applyBilingualHostTranslation(host, [node], translated);
       return;
     }
 
@@ -2690,22 +3007,33 @@
     }
 
     const originalText = translatedNodes.get(node) ?? node.textContent;
-    const placement = resolveBilingualPlacement(node, originalText, translated);
+    if (shouldSkipBilingualUi(node.parentElement || node, originalText)) return;
+
+    let placement = resolveBilingualPlacement(node, originalText, translated);
+    if (placement === 'inline' && isFragileInsertParent(node.parentNode)) {
+      placement = 'block';
+    }
 
     isApplyingTranslation = true;
     try {
-      let el = findBilingualElement(node);
-      if (!el) {
-        el = document.createElement('span');
-        el.setAttribute('translate', 'no');
-        el.setAttribute('data-arya-bilingual', '1');
-        if (node.nextSibling) node.parentNode.insertBefore(el, node.nextSibling);
-        else node.parentNode.appendChild(el);
-        bilingualElements.set(node, el);
+      const existing = findBilingualElement(node);
+      if (existing) {
+        removeBilingualArtifactsBefore(existing);
+        existing.remove();
+        bilingualElements.delete(node);
       }
-      el.className = bilingualClassForPlacement(placement);
-      el.textContent = translated;
-      if (placement === 'block') expandBilingualAncestors(node.parentElement || node);
+      const el = createBilingualElement(translated, placement);
+      let mountParent = node.parentNode;
+      if (placement === 'block') {
+        const mounted = mountBilingualNear(node, el, placement);
+        mountParent = mounted.parent;
+      } else {
+        insertBilingualAfter(node.parentNode, node, el, placement);
+      }
+      bilingualElements.set(node, el);
+      if (placement === 'block') {
+        expandBilingualAncestors(mountParent || node.parentElement || node);
+      }
     } finally {
       isApplyingTranslation = false;
     }
@@ -2798,7 +3126,11 @@
       }
     });
 
+    scope.querySelectorAll('.arya-bilingual-break, [data-arya-bilingual-break="1"]').forEach((el) => {
+      el.remove();
+    });
     scope.querySelectorAll('.arya-bilingual, [data-arya-bilingual="1"]').forEach((el) => {
+      removeBilingualArtifactsBefore(el);
       el.remove();
     });
     clearBilingualHosts(scope);
@@ -2847,6 +3179,7 @@
       }
     } finally {
       isApplyingTranslation = false;
+      setAryaDualState(false);
     }
   }
 
@@ -3561,6 +3894,7 @@
       || changes.siteRules
       || changes.selectionDelayMs
       || changes.selectionMinLength
+      || changes.translationTheme
     ) {
       refreshUiWidgets();
       if (changes.targetLang?.newValue) syncFloatBallLangSelect(changes.targetLang.newValue);
@@ -3569,10 +3903,12 @@
           activeSettings.bilingualMode = settings.bilingualMode;
           activeSettings.watchMode = settings.watchMode;
           activeSettings.skipSelectors = settings.skipSelectors;
+          activeSettings.translationTheme = settings.translationTheme;
         }
         uiFeatureFlags.bilingualMode = settings.bilingualMode;
         uiFeatureFlags.selectionDelayMs = settings.selectionDelayMs;
         uiFeatureFlags.selectionMinLength = settings.selectionMinLength;
+        uiFeatureFlags.translationTheme = settings.translationTheme;
         syncFloatBallBilingualToggle(settings.bilingualMode);
       });
     }
