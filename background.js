@@ -1082,7 +1082,7 @@ function ensureContextMenus() {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: 'arya-translate-page',
-      title: 'Arya：翻译此页面',
+      title: 'Arya：翻译页面/恢复页面',
       contexts: ['page', 'editable', 'frame']
     });
     chrome.contextMenus.create({
@@ -1108,18 +1108,6 @@ async function queryPageTranslated(tabId) {
   }
 }
 
-async function syncPageContextMenu(tabId) {
-  const translated = await queryPageTranslated(tabId);
-  try {
-    await chrome.contextMenus.update('arya-translate-page', {
-      title: translated ? 'Arya：恢复原文' : 'Arya：翻译此页面'
-    });
-  } catch {
-    // 菜单尚未创建时忽略
-  }
-  return translated;
-}
-
 chrome.runtime.onInstalled.addListener(() => {
   ensureContextMenus();
 });
@@ -1128,28 +1116,16 @@ chrome.runtime.onStartup?.addListener?.(() => {
   ensureContextMenus();
 });
 
-if (chrome.contextMenus.onShown) {
-  chrome.contextMenus.onShown.addListener(async (_info, tab) => {
-    if (!tab?.id) return;
-    try {
-      await syncPageContextMenu(tab.id);
-      if (chrome.contextMenus.refresh) await chrome.contextMenus.refresh();
-    } catch {
-      // ignore
-    }
-  });
-}
-
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   if (info.menuItemId === 'arya-translate-page') {
+    // 固定文案「翻译页面/恢复页面」：按页面实际状态切换，避免菜单标题不同步
     const translated = await queryPageTranslated(tab.id);
     if (translated) {
       await broadcastToContentScript(tab.id, 'restore');
     } else {
       await sendPageTranslate(tab.id);
     }
-    await syncPageContextMenu(tab.id);
   } else if (info.menuItemId === 'arya-translate-selection') {
     await sendSelectionTranslate(tab.id, {
       selectionText: info.selectionText || ''
@@ -1254,6 +1230,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === 'openAfdianPage') {
     chrome.tabs.create({ url: getAfdianPageUrl(), active: true });
+    sendResponse({ success: true });
+    return true;
+  }
+
+  if (message.action === 'openOptionsPage') {
+    chrome.runtime.openOptionsPage();
     sendResponse({ success: true });
     return true;
   }

@@ -111,20 +111,19 @@ function updateModelHint(modelId) {
 }
 
 function updateAccessHint(config, modelId) {
+  // 始终展示免费提示，避免换模型 / 自备 Key 后文案消失
+  paymentBanner.classList.remove('hidden');
+  paymentBannerText.textContent = 'Arya 翻译完全免费，欢迎支持作者';
+  upgradeBtn.textContent = '打赏';
+
   if (!config) return;
 
   const isBailianMt = getModelProvider(modelId) === 'bailian'
     && modelId?.trim().toLowerCase().startsWith('qwen-mt');
 
   if (config.usingHostedKey && isBailianMt) {
-    paymentBanner.classList.remove('hidden');
-    paymentBannerText.textContent = 'Arya 完全免费，欢迎支持作者 💙';
-    upgradeBtn.textContent = '打赏';
-    modelSubtitle.textContent = `${config.modelName || ''} · 免费`;
-    return;
+    modelSubtitle.textContent = `${config.modelName || getModelName(modelId)} · 免费`;
   }
-
-  paymentBanner.classList.add('hidden');
 }
 
 async function init() {
@@ -171,6 +170,9 @@ async function init() {
 modelSelect.addEventListener('change', () => {
   chrome.storage.sync.set({ model: modelSelect.value });
   updateModelHint(modelSelect.value);
+  chrome.runtime.sendMessage({ action: 'getConfig' }, (response) => {
+    updateAccessHint(response?.config, modelSelect.value);
+  });
 });
 
 targetLangSelect.addEventListener('change', () => {

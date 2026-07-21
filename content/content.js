@@ -189,7 +189,9 @@
   function isPageTranslationActive() {
     if (pageTranslationActive || watchModeActive) return true;
     try {
-      return Boolean(document.querySelector('.arya-bilingual, [data-arya-bilingual="1"]'));
+      return Boolean(document.querySelector(
+        '.arya-bilingual, [data-arya-bilingual="1"], [data-arya-replaced="1"]'
+      ));
     } catch {
       return pageTranslationActive;
     }
@@ -598,29 +600,80 @@
     return null;
   }
 
+  function getBilingualOriginalFromEl(el) {
+    if (!el) return '';
+    const wrap = el.closest?.('.arya-bilingual, [data-arya-bilingual="1"]') || (
+      el.classList?.contains('arya-bilingual') ? el : null
+    );
+    if (!wrap) return '';
+    return (wrap.getAttribute('data-arya-original') || '').trim();
+  }
+
+  /** 悬停原文提示：优先整段原文（双语 / 替换模式块），避免链接拆句后只显示末尾碎片 */
+  function resolveOriginalForHover(clientX, clientY, target) {
+    try {
+      const hit = document.elementFromPoint(clientX, clientY) || target;
+      const fromBi = getBilingualOriginalFromEl(hit);
+      if (fromBi) return { original: fromBi, key: `bi:${fromBi.slice(0, 48)}` };
+      const replaced = hit?.closest?.('[data-arya-original][data-arya-replaced="1"]');
+      const replacedOriginal = (replaced?.getAttribute('data-arya-original') || '').trim();
+      if (replacedOriginal) {
+        return { original: replacedOriginal, key: `rep:${replacedOriginal.slice(0, 48)}` };
+      }
+    } catch {
+      // ignore
+    }
+
+    const node = resolveTextNodeAtPoint(clientX, clientY);
+    if (!node) return null;
+
+    const host = findInteractiveHost(node);
+    if (host) {
+      const hostBi = bilingualElements.get(host);
+      const hostOriginal = getBilingualOriginalFromEl(hostBi)
+        || (hostBi?.getAttribute?.('data-arya-original') || '').trim()
+        || (host.getAttribute?.('data-arya-original') || '').trim();
+      if (hostOriginal) return { original: hostOriginal, key: `host:${hostOriginal.slice(0, 48)}` };
+    }
+
+    const block = findTranslationBlock(node);
+    if (block) {
+      const blockBi = bilingualElements.get(block);
+      const blockOriginal = (blockBi?.getAttribute?.('data-arya-original') || '').trim()
+        || (block.getAttribute?.('data-arya-original') || '').trim();
+      if (blockOriginal) return { original: blockOriginal, key: `block:${blockOriginal.slice(0, 48)}` };
+    }
+
+    const sibBi = findBilingualElement(node);
+    const sibOriginal = (sibBi?.getAttribute?.('data-arya-original') || '').trim();
+    if (sibOriginal) return { original: sibOriginal, key: `sib:${sibOriginal.slice(0, 48)}` };
+
+    if (!translatedNodes.has(node)) return null;
+    const original = translatedNodes.get(node);
+    if (original == null || !String(original).trim() || original === node.textContent) return null;
+    return { original: String(original), key: node };
+  }
+
   function onOriginalTooltipMove(e) {
     if (originalTooltipRaf) return;
     const { clientX, clientY, target } = e;
     originalTooltipRaf = requestAnimationFrame(() => {
       originalTooltipRaf = null;
-      if (isOurOverlayElement(target)) {
+      // 双语译文本身要能提示原文；其它插件 UI 仍忽略
+      const onBilingual = Boolean(target?.closest?.('.arya-bilingual, [data-arya-bilingual="1"]'));
+      if (!onBilingual && isOurOverlayElement(target)) {
         hideOriginalTooltip();
         return;
       }
-      const node = resolveTextNodeAtPoint(clientX, clientY);
-      if (!node || !translatedNodes.has(node)) {
+      const resolved = resolveOriginalForHover(clientX, clientY, target);
+      if (!resolved?.original) {
         if (lastTooltipNode) hideOriginalTooltip();
         return;
       }
-      const original = translatedNodes.get(node);
-      if (original == null || !String(original).trim() || original === node.textContent) {
-        hideOriginalTooltip();
-        return;
-      }
       const tip = ensureOriginalTooltip();
-      if (lastTooltipNode !== node) {
-        tip.textContent = original;
-        lastTooltipNode = node;
+      if (lastTooltipNode !== resolved.key) {
+        tip.textContent = resolved.original;
+        lastTooltipNode = resolved.key;
       }
       positionOriginalTooltip(tip, clientX, clientY);
     });
@@ -638,6 +691,38 @@
     return false;
   }
 
+  function getActiveSelectionSnapshot() {
+    const sel = window.getSelection();
+    if (!sel?.rangeCount || sel.isCollapsed) return null;
+    const text = sel.toString().trim();
+    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
+    if (!text || text.length < minLen || isLikelyNonTranslatable(text)) return null;
+    try {
+      const range = sel.getRangeAt(0);
+      if (!selectionBelongsToThisFrame(range)) return null;
+      return {
+        text,
+        range: range.cloneRange(),
+        allowApply: !isSelectionInEditableContext(range)
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function pickSelectionAnchorRect(range) {
+    const clientRects = [...range.getClientRects()].filter((r) => r.width > 0 || r.height > 0);
+    if (!clientRects.length) {
+      const fallback = range.getBoundingClientRect();
+      return fallback?.width || fallback?.height ? fallback : null;
+    }
+    // 多行选区：粉点用末尾，避免飞到选区大框右上角；超长时略往中间靠，减少盖住下一条标题
+    if (clientRects.length >= 6) {
+      return clientRects[Math.floor(clientRects.length * 0.7)];
+    }
+    return clientRects[clientRects.length - 1];
+  }
+
   function scheduleSelectionBubble() {
     if (selectionBubbleRaf) {
       cancelAnimationFrame(selectionBubbleRaf);
@@ -647,7 +732,7 @@
       clearTimeout(selectionBubbleTimer);
       selectionBubbleTimer = null;
     }
-    // 已有粉点时（如滚动跟随）立即重定位；新选区则短延迟再出点
+    // 已有粉点时（如滚动跟随 / 选区变化）立即重定位；新选区则短延迟再出点
     const delay = selectionBubbleEl
       ? 0
       : Math.max(0, Number(uiFeatureFlags.selectionDelayMs) || 280);
@@ -661,17 +746,12 @@
   }
 
   function onSelectionScroll() {
-    const sel = window.getSelection();
-    if (!sel?.rangeCount || sel.isCollapsed) {
+    const snap = getActiveSelectionSnapshot();
+    if (!snap) {
       hideSelectionBubble();
       return;
     }
-    const text = sel.toString().trim();
-    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
-    if (!text || text.length < minLen) {
-      hideSelectionBubble();
-      return;
-    }
+    cachedSelection = { text: snap.text, range: snap.range };
     scheduleSelectionBubble();
   }
 
@@ -759,8 +839,22 @@
       applyBtn.onclick = (e) => {
         e.preventDefault();
         e.stopPropagation();
+        // 译入页面与预览用同一段原文，避免选区已变却仍显示旧译文
+        try {
+          const live = getActiveSelectionSnapshot();
+          if (live) {
+            cachedSelection = { text: live.text, range: live.range };
+          } else if (sourceText) {
+            cachedSelection = {
+              text: sourceText,
+              range: cachedSelection?.range || null
+            };
+          }
+        } catch {
+          // ignore
+        }
         hideSelectionBubble();
-        translateSelection().then((result) => {
+        translateSelection({ selectionText: sourceText }).then((result) => {
           if (result?.success) {
             showOverlay(`完成！已翻译选中内容${formatUsageSuffix()}`, 100);
             setTimeout(hideOverlay, 1800);
@@ -796,48 +890,41 @@
     }
   }
 
-  function showSelectionBubble() {
+  function showSelectionBubble(options = {}) {
     if (!uiFeatureFlags.showSelectionDot) {
       hideSelectionBubble();
       return;
     }
-    if (isTranslating || isProcessingIncremental) return;
 
-    const sel = window.getSelection();
-    if (!sel?.rangeCount || sel.isCollapsed) {
+    const snap = getActiveSelectionSnapshot();
+    if (!snap) {
       hideSelectionBubble();
       return;
     }
 
-    const text = sel.toString().trim();
-    const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
-    if (!text || text.length < minLen || isLikelyNonTranslatable(text)) {
-      hideSelectionBubble();
-      return;
-    }
-
-    let range;
-    let allowApply = true;
-    try {
-      range = sel.getRangeAt(0);
-      if (!selectionBelongsToThisFrame(range)) {
-        hideSelectionBubble();
-        return;
-      }
-      allowApply = !isSelectionInEditableContext(range);
-    } catch {
-      hideSelectionBubble();
-      return;
-    }
+    const { text, range, allowApply } = snap;
+    cachedSelection = { text, range: range.cloneRange() };
 
     ensureOverlayStyles();
-    hideSelectionBubble();
+    // 只卸 DOM，保留即将打开的预览意图；避免 hide 清掉一切后再丢 openPreview
+    if (selectionBubbleTimer) {
+      clearTimeout(selectionBubbleTimer);
+      selectionBubbleTimer = null;
+    }
+    if (selectionBubbleRaf) {
+      cancelAnimationFrame(selectionBubbleRaf);
+      selectionBubbleRaf = null;
+    }
+    if (!options.keepPanel) hideSelectionPanel();
+    if (selectionBubbleEl) {
+      selectionBubbleEl.remove();
+      selectionBubbleEl = null;
+    }
+    document.querySelectorAll('#arya-selection-bubble, .arya-selection-bubble').forEach((el) => {
+      el.remove();
+    });
 
-    // 多行选区时 getBoundingClientRect 会很大，粉点易飞到很远；改用末尾可见小矩形
-    const clientRects = [...range.getClientRects()].filter((r) => r.width > 0 || r.height > 0);
-    const rect = clientRects.length
-      ? clientRects[clientRects.length - 1]
-      : range.getBoundingClientRect();
+    const rect = pickSelectionAnchorRect(range);
     if (!rect || (!rect.width && !rect.height)) {
       hideSelectionBubble();
       return;
@@ -846,6 +933,7 @@
     const bubble = document.createElement('div');
     bubble.id = 'arya-selection-bubble';
     bubble.className = 'arya-selection-bubble';
+    bubble.dataset.aryaSelText = text;
     bubble.innerHTML = '<button type="button" class="arya-sel-dot" title="悬停查看译文" aria-label="翻译预览"></button>';
 
     const left = Math.min(Math.max(rect.right + 4, 8), window.innerWidth - 22);
@@ -859,8 +947,21 @@
         clearTimeout(selectionPanelHideTimer);
         selectionPanelHideTimer = null;
       }
+      const live = getActiveSelectionSnapshot();
+      if (!live) {
+        hideSelectionBubble();
+        return;
+      }
+      const bound = bubble.dataset.aryaSelText || '';
+      // 高亮已变、粉点仍是旧文案：先按新选区重建再预览
+      if (live.text !== bound) {
+        cachedSelection = { text: live.text, range: live.range };
+        showSelectionBubble({ openPreview: true });
+        return;
+      }
+      cachedSelection = { text: live.text, range: live.range };
       const dotRect = dot.getBoundingClientRect();
-      showSelectionPreviewPanel(text, dotRect, allowApply);
+      showSelectionPreviewPanel(live.text, dotRect, live.allowApply);
     };
 
     dot.addEventListener('mousedown', (e) => {
@@ -879,6 +980,12 @@
 
     document.documentElement.appendChild(bubble);
     selectionBubbleEl = bubble;
+
+    if (options.openPreview) {
+      requestAnimationFrame(() => {
+        if (selectionBubbleEl === bubble) openPanel();
+      });
+    }
   }
 
   document.addEventListener('mouseup', updateCachedSelection, true);
@@ -983,6 +1090,8 @@
     wrapper.setAttribute('data-arya-bilingual', '1');
     if (extras.host) wrapper.setAttribute('data-arya-host', '1');
     if (extras.block) wrapper.setAttribute('data-arya-block', '1');
+    const original = String(extras.original || '').trim();
+    if (original) wrapper.setAttribute('data-arya-original', original);
     const targetLang = activeSettings?.targetLang || '';
     const lang = SPEECH_LANG_MAP[targetLang];
     if (lang) wrapper.setAttribute('lang', lang);
@@ -1327,7 +1436,23 @@
     }
   }
 
-  async function translateSelectionSegments(segments, settings) {
+  async function translateSelectionSegments(segments, settings, fullText = '') {
+    const joined = String(fullText || segments.map((s) => s.text).join(' ')).replace(/\s+/g, ' ').trim();
+    // 与粉点预览一致：多段（行内链接拆开）时整段一次翻译再写回
+    if (segments.length > 1 && joined) {
+      const translations = settings.isMt
+        ? await translateBatchStreaming([joined])
+        : await translateBatchWithRetry([joined]);
+      const translated = translations?.[0];
+      if (!isValidTranslation(translated)) return { count: 0 };
+      applyReplaceFragmentTranslation(
+        segments.map((s) => s.node),
+        translated,
+        joined
+      );
+      return { count: 1 };
+    }
+
     const textToSegments = new Map();
     const uniqueTexts = [];
 
@@ -1365,8 +1490,19 @@
   }
 
   function resolveSelectionRange(message = {}) {
+    const preferred = message.selectionText?.trim();
     const sel = window.getSelection();
     const liveText = sel?.toString()?.trim();
+
+    // 划词预览「译入页面」传入的原文优先，避免选区已变却译了别的
+    if (preferred && cachedSelection?.range) {
+      try {
+        const range = cachedSelection.range.cloneRange();
+        return { text: preferred, range };
+      } catch {
+        cachedSelection = null;
+      }
+    }
 
     if (liveText && sel?.rangeCount && !sel.isCollapsed) {
       try {
@@ -1381,7 +1517,7 @@
     if (cachedSelection?.range) {
       try {
         const range = cachedSelection.range.cloneRange();
-        const text = message.selectionText?.trim() || cachedSelection.text || range.toString().trim();
+        const text = preferred || cachedSelection.text || range.toString().trim();
         if (text) return { text, range };
       } catch {
         cachedSelection = null;
@@ -1392,12 +1528,12 @@
   }
 
   function ensureOverlayStyles() {
-    const STYLE_VERSION = '14';
+    const STYLE_VERSION = '18';
     let style = document.getElementById('bailian-translate-styles');
     if (style?.dataset?.version === STYLE_VERSION) return;
     if (!style) {
       style = document.createElement('style');
-      style.id = 'bailian-translate-styles';
+    style.id = 'bailian-translate-styles';
       document.head.appendChild(style);
     }
     style.dataset.version = STYLE_VERSION;
@@ -1580,6 +1716,27 @@
       #arya-float-ball .arya-fb-toggle span {
         font-size: 12px; font-weight: 600; color: #be123c;
       }
+      #arya-float-ball .arya-fb-links {
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        margin-top: 10px;
+      }
+      #arya-float-ball .arya-fb-donate {
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        margin-top: 12px; padding: 9px 10px; border-radius: 12px;
+        background: #fff7ed; border: 1px solid #ffedd5;
+      }
+      #arya-float-ball .arya-fb-donate-text {
+        flex: 1; min-width: 0; font-size: 11px; font-weight: 600; color: #9a3412; line-height: 1.35;
+      }
+      #arya-float-ball .arya-fb-link {
+        appearance: none; background: none; border: none; padding: 0; margin: 0;
+        font-size: 12px; font-weight: 600; color: #e11d48; cursor: pointer;
+        text-decoration: none; font-family: inherit;
+      }
+      #arya-float-ball .arya-fb-link:hover { color: #be123c; text-decoration: underline; }
+      #arya-float-ball .arya-fb-link.settings { padding-left: 10px; }
+      #arya-float-ball .arya-fb-link.donate { color: #ea580c; flex-shrink: 0; }
+      #arya-float-ball .arya-fb-link.donate:hover { color: #c2410c; }
       :root {
         --arya-theme-underline: #fb7185;
         --arya-theme-blockquote: #f43f5e;
@@ -1921,6 +2078,13 @@
           <button type="button" class="arya-fb-btn cancel" data-action="cancel">取消翻译</button>
           <button type="button" class="arya-fb-btn restore" data-action="restore">恢复原文</button>
         </div>
+        <div class="arya-fb-donate">
+          <span class="arya-fb-donate-text">Arya 翻译完全免费</span>
+          <button type="button" class="arya-fb-link donate" data-action="donate">打赏</button>
+        </div>
+        <div class="arya-fb-links">
+          <button type="button" class="arya-fb-link settings" data-action="settings">设置与 API</button>
+        </div>
       </div>
     `;
 
@@ -1995,6 +2159,22 @@
         setTimeout(hideOverlay, 1200);
       }
       setFloatBallTranslating(false);
+    });
+
+    ball.querySelector('[data-action="settings"]').addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        chrome.runtime.openOptionsPage();
+      } catch {
+        runtimeSend({ action: 'openOptionsPage' }).catch(() => {});
+      }
+    });
+
+    ball.querySelector('[data-action="donate"]').addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      runtimeSend({ action: 'openAfdianPage' }).catch(() => {});
     });
 
     document.addEventListener('mousedown', (e) => {
@@ -2315,8 +2495,7 @@
   }
 
   function findTranslationBlock(node) {
-    if (findInteractiveHost(node)) return null;
-    let el = node.parentElement;
+    let el = node?.parentElement;
     let divFallback = null;
     while (el && el !== document.body && el !== document.documentElement) {
       if (shouldSkipElement(el)) return null;
@@ -2330,12 +2509,54 @@
     return divFallback;
   }
 
+  /**
+   * 仅把「整颗控件」当 host 单独译。
+   * 段落/列表里的行内链接必须并入父级 block，否则句子被掏空，易译成错乱拼接。
+   */
+  function shouldTranslateHostSeparately(host) {
+    if (!host) return false;
+    if (isCompactTranslationContext(host)) return true;
+    if (host.matches?.('button, summary, [role="button"], [role="menuitem"], [role="tab"]')) {
+      return true;
+    }
+
+    const blockParent = host.closest(
+      'p, li, dd, dt, h1, h2, h3, h4, h5, h6, td, th, blockquote, figcaption'
+    );
+    if (!blockParent || blockParent === host) return true;
+
+    try {
+      const full = (blockParent.innerText || blockParent.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const hostText = getHostVisibleText(host) || (host.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!full) return true;
+      if (!hostText) return false;
+      // 链接几乎就是整段（如单独的 CTA）→ 仍按 host
+      if (full.length <= hostText.length + 12) return true;
+      // 段内还有大量其它文案 → 行内链接，并入 block
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   function compareDocumentOrder(a, b) {
     if (a === b) return 0;
     const pos = a.compareDocumentPosition(b);
     if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
     if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
     return 0;
+  }
+
+  function joinBlockTextInOrder(nodes) {
+    return [...nodes]
+      .sort(compareDocumentOrder)
+      .map((n) => (n.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   function groupTextNodesIntoUnits(textNodes) {
@@ -2348,9 +2569,8 @@
       const text = node.textContent?.trim() || '';
       if (!text || isLikelyNonTranslatable(text)) continue;
 
-      // 链接/按钮：整颗控件只译一次，避免「联系销售」出两条译文
       const host = findInteractiveHost(node);
-      if (host) {
+      if (host && shouldTranslateHostSeparately(host)) {
         let bucket = hostBuckets.get(host);
         if (!bucket) {
           bucket = { host, nodes: [] };
@@ -2384,7 +2604,6 @@
 
     for (const { host, nodes } of hostBuckets.values()) {
       const ordered = [...new Set(nodes)].sort(compareDocumentOrder);
-      // 只保留当前真正可见的节点，避免 mobile/desktop 双文案都被送去翻译
       const visibleNodes = ordered.filter((node) => {
         let el = node.parentElement;
         while (el && el !== host.parentElement) {
@@ -2395,40 +2614,35 @@
         return true;
       });
       const nodesForUnit = visibleNodes.length ? visibleNodes : ordered;
-      const text = getHostVisibleText(host)
-        || dedupeNestedPhrases(nodesForUnit.map((n) => (n.textContent || '').trim())).join(' ').replace(/\s+/g, ' ').trim();
-      if (!text || isLikelyNonTranslatable(text)) continue;
+      const unitText = getHostVisibleText(host)
+        || joinBlockTextInOrder(nodesForUnit);
+      if (!unitText || isLikelyNonTranslatable(unitText)) continue;
       units.push({
         __aryaUnit: true,
         kind: 'host',
         host,
         nodes: nodesForUnit,
-        text
+        text: unitText
       });
     }
 
     for (const { block, nodes } of blockBuckets.values()) {
       const ordered = [...new Set(nodes)].sort(compareDocumentOrder);
-      const text = ordered
-        .map((n) => (n.textContent || '').trim())
-        .filter(Boolean)
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      if (!text || isLikelyNonTranslatable(text)) continue;
+      const unitText = joinBlockTextInOrder(ordered);
+      if (!unitText || isLikelyNonTranslatable(unitText)) continue;
 
-      if (ordered.length === 1 && text.length < 42) {
+      if (ordered.length === 1 && unitText.length < 42) {
         units.push({
           __aryaUnit: true,
           kind: 'node',
           node: ordered[0],
           nodes: ordered,
-          text
+          text: unitText
         });
         continue;
       }
 
-      if (ordered.length > 48 || text.length > 4500) {
+      if (ordered.length > 48 || unitText.length > 4500) {
         for (const node of ordered) {
           const t = (node.textContent || '').trim();
           if (!t || isLikelyNonTranslatable(t)) continue;
@@ -2448,7 +2662,7 @@
         kind: 'block',
         block,
         nodes: ordered,
-        text
+        text: unitText
       });
     }
 
@@ -2486,9 +2700,8 @@
     const textToNodes = new Map();
     const uniqueTexts = [];
 
-    const targets = isBilingualMode()
-      ? groupTextNodesIntoUnits(textNodes)
-      : textNodes;
+    // 替换模式也要按段落/列表聚合，否则行内链接会拆句导致译文错乱、悬停只剩末尾碎片
+    const targets = groupTextNodesIntoUnits(textNodes);
 
     for (const target of targets) {
       const text = target?.__aryaUnit
@@ -2932,7 +3145,7 @@
         break;
       }
 
-      const el = createBilingualElement(translated, placement, { host: true });
+      const el = createBilingualElement(translated, placement, { host: true, original: source });
       const mounted = mountBilingualNear(host, el, placement);
       bilingualElements.set(host, el);
       host.setAttribute('data-arya-bilingual-host', '1');
@@ -2962,7 +3175,7 @@
 
     isApplyingTranslation = true;
     try {
-      const el = createBilingualElement(translated, placement, { block: true });
+      const el = createBilingualElement(translated, placement, { block: true, original: joinedOriginal });
       let mounted;
       if (placement === 'inline' && measureAnchor?.parentNode && !isFragileInsertParent(measureAnchor.parentNode)) {
         insertBilingualAfter(measureAnchor.parentNode, measureAnchor, el, placement);
@@ -2982,14 +3195,13 @@
   function applyBilingualTranslation(node, translated) {
     if (!node?.parentNode || !isValidTranslation(translated)) return;
 
-    // 若已在链接/按钮宿主上挂过译文，不再给内部 text node 重复挂
+    // 若已在「独立」链接/按钮宿主上挂过译文，不再给内部 text node 重复挂
     const host = findInteractiveHost(node);
-    if (host && bilingualElements.get(host)?.isConnected) {
-      if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
-      return;
-    }
-    // 交互控件改走 host 外侧挂载
-    if (host) {
+    if (host && shouldTranslateHostSeparately(host)) {
+      if (bilingualElements.get(host)?.isConnected) {
+        if (!translatedNodes.has(node)) translatedNodes.set(node, node.textContent);
+        return;
+      }
       applyBilingualHostTranslation(host, [node], translated);
       return;
     }
@@ -3022,7 +3234,7 @@
         existing.remove();
         bilingualElements.delete(node);
       }
-      const el = createBilingualElement(translated, placement);
+      const el = createBilingualElement(translated, placement, { original: originalText });
       let mountParent = node.parentNode;
       if (placement === 'block') {
         const mounted = mountBilingualNear(node, el, placement);
@@ -3039,6 +3251,87 @@
     }
   }
 
+  function markReplacedOriginal(el, original) {
+    if (!el || !original) return;
+    try {
+      el.setAttribute('data-arya-replaced', '1');
+      el.setAttribute('data-arya-original', original);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** 替换模式：多文本节点（常因行内链接拆开）整段一次写入，悬停可还原整句 */
+  function applyReplaceFragmentTranslation(nodes, translated, original) {
+    if (!isValidTranslation(translated)) return;
+    const ordered = [...new Set(nodes || [])]
+      .filter((n) => n?.isConnected)
+      .sort(compareDocumentOrder);
+    if (!ordered.length) return;
+
+    // 每个节点只存自己的原文碎片；整句留给 data-arya-original 做悬停。
+    // 若把整句写进 first 的 translatedNodes，恢复时其它碎片再还原 → 原文重复。
+    for (const node of ordered) {
+      if (!translatedNodes.has(node)) {
+        translatedNodes.set(node, node.textContent);
+      }
+    }
+
+    const fullOriginal = String(
+      original
+      || ordered
+        .map((n) => String(translatedNodes.get(n) ?? '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .join(' ')
+    ).replace(/\s+/g, ' ').trim();
+
+    isApplyingTranslation = true;
+    try {
+      const first = ordered[0];
+      first.textContent = translated;
+
+      const anchorEl = first.parentElement || findTranslationBlock(first);
+      if (anchorEl) markReplacedOriginal(anchorEl, fullOriginal);
+
+      for (let i = 1; i < ordered.length; i++) {
+        ordered[i].textContent = '';
+      }
+    } finally {
+      isApplyingTranslation = false;
+    }
+  }
+
+  function applyReplaceHostTranslation(host, nodes, translated, original) {
+    if (!host?.isConnected || !isValidTranslation(translated)) return;
+    const source = String(original || getHostVisibleText(host) || '').trim();
+    const targets = (nodes || []).filter((n) => n?.isConnected);
+    if (targets.length) {
+      applyReplaceFragmentTranslation(targets, translated, source);
+    } else {
+      isApplyingTranslation = true;
+      try {
+        const textNode = [...host.childNodes].find((n) => n.nodeType === Node.TEXT_NODE && n.textContent.trim());
+        if (textNode) {
+          if (!translatedNodes.has(textNode)) translatedNodes.set(textNode, textNode.textContent);
+          textNode.textContent = translated;
+        } else {
+          host.textContent = translated;
+        }
+        markReplacedOriginal(host, source);
+      } finally {
+        isApplyingTranslation = false;
+      }
+    }
+    markReplacedOriginal(host, source);
+  }
+
+  function applyReplaceBlockTranslation(blockEl, nodes, translated, original) {
+    if (!blockEl?.isConnected || !isValidTranslation(translated)) return;
+    const source = String(original || joinBlockTextInOrder(nodes) || '').trim();
+    applyReplaceFragmentTranslation(nodes, translated, source);
+    markReplacedOriginal(blockEl, source);
+  }
+
   function applyTranslationUnit(unit, translated) {
     if (!unit || !isValidTranslation(translated)) return;
     if (unit.kind === 'host' && unit.host && isBilingualMode()) {
@@ -3049,7 +3342,19 @@
       applyBilingualBlockTranslation(unit.block, unit.nodes || [], translated);
       return;
     }
+    if (unit.kind === 'host' && unit.host && !isBilingualMode()) {
+      applyReplaceHostTranslation(unit.host, unit.nodes || [], translated, unit.text);
+      return;
+    }
+    if (unit.kind === 'block' && unit.block && !isBilingualMode()) {
+      applyReplaceBlockTranslation(unit.block, unit.nodes || [], translated, unit.text);
+      return;
+    }
     const nodes = unit.nodes || (unit.node ? [unit.node] : []);
+    if (!isBilingualMode() && nodes.length > 1) {
+      applyReplaceFragmentTranslation(nodes, translated, unit.text);
+      return;
+    }
     for (const node of nodes) applyTranslation(node, translated);
   }
 
@@ -3134,6 +3439,11 @@
       el.remove();
     });
     clearBilingualHosts(scope);
+
+    scope.querySelectorAll('[data-arya-replaced="1"]').forEach((el) => {
+      el.removeAttribute('data-arya-replaced');
+      el.removeAttribute('data-arya-original');
+    });
 
     const elWalker = document.createTreeWalker(scope, NodeFilter.SHOW_ELEMENT);
     while (elWalker.nextNode()) {
@@ -3691,7 +4001,7 @@
       const settings = await getSettings();
       activeSettings = settings;
       showOverlay(`Arya 正在翻译「${selectedText.slice(0, 24)}${selectedText.length > 24 ? '…' : ''}」`, 15);
-      const result = await translateSelectionSegments(segments, settings);
+      const result = await translateSelectionSegments(segments, settings, selectedText);
 
       if (cancelRequested) {
         return { success: false, cancelled: true, error: '翻译已取消' };
