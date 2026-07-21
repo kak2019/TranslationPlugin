@@ -3261,6 +3261,55 @@
     }
   }
 
+  /** 链接之间常见的 ", " "·" 等碎片：收集时被跳过，替换整句后会残留在译文末尾 */
+  function isGlueTextNode(node) {
+    if (!node || node.nodeType !== Node.TEXT_NODE) return false;
+    const raw = String(node.textContent || '');
+    if (!raw.trim()) return true;
+    const t = raw.trim();
+    if (/[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(t)) {
+      return false;
+    }
+    return /^[\d\s.,;:!?'"`´“”‘’\-–—…·•、，。！？；：：（）()\[\]{}<>\/\\|@#$%^&*_+=~]+$/.test(t);
+  }
+
+  function clearGlueTextNodesAround(ordered) {
+    if (!ordered?.length) return;
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    const block = findTranslationBlock(first) || first.parentElement;
+    if (!block?.isConnected) return;
+
+    const kept = new Set(ordered);
+    const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    let started = false;
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (node === first) started = true;
+      if (!started) continue;
+
+      if (!kept.has(node) && isGlueTextNode(node)) {
+        if (!translatedNodes.has(node)) {
+          translatedNodes.set(node, node.textContent);
+        }
+        node.textContent = '';
+      }
+
+      if (node === last) {
+        while (walker.nextNode()) {
+          const trailing = walker.currentNode;
+          if (!isGlueTextNode(trailing)) break;
+          if (!translatedNodes.has(trailing)) {
+            translatedNodes.set(trailing, trailing.textContent);
+          }
+          trailing.textContent = '';
+        }
+        break;
+      }
+    }
+  }
+
   /** 替换模式：多文本节点（常因行内链接拆开）整段一次写入，悬停可还原整句 */
   function applyReplaceFragmentTranslation(nodes, translated, original) {
     if (!isValidTranslation(translated)) return;
@@ -3296,6 +3345,8 @@
       for (let i = 1; i < ordered.length; i++) {
         ordered[i].textContent = '';
       }
+
+      clearGlueTextNodesAround(ordered);
     } finally {
       isApplyingTranslation = false;
     }
