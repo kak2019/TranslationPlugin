@@ -80,6 +80,10 @@
   let inputFabEl = null;
   let inputFabTarget = null;
   let inputFabHideTimer = null;
+  let inputFabDragOffset = { x: 0, y: 0 };
+  let inputFabDragMoved = false;
+  let inputFabOffsetLoaded = false;
+  const INPUT_FAB_OFFSET_KEY = 'aryaInputFabDragOffset';
   let uiFeatureFlags = {
     showFloatBall: true,
     showSelectionDot: true,
@@ -1340,6 +1344,7 @@
     let parent = node.parentElement;
     while (parent) {
       if (SKIP_TAGS.has(parent.tagName)) return true;
+      if (parent.isContentEditable) return true;
       if (shouldSkipElement(parent)) return true;
       parent = parent.parentElement;
     }
@@ -1350,6 +1355,7 @@
     let parent = node.parentElement;
     while (parent) {
       if (SKIP_TAGS.has(parent.tagName)) return true;
+      if (parent.isContentEditable) return true;
       if (shouldSkipElement(parent)) return true;
       parent = parent.parentElement;
     }
@@ -1528,7 +1534,7 @@
   }
 
   function ensureOverlayStyles() {
-    const STYLE_VERSION = '18';
+    const STYLE_VERSION = '19';
     let style = document.getElementById('bailian-translate-styles');
     if (style?.dataset?.version === STYLE_VERSION) return;
     if (!style) {
@@ -1832,14 +1838,17 @@
       #arya-input-fab {
         position: fixed; z-index: 2147483644; display: none;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+        touch-action: none;
       }
       #arya-input-fab button {
-        border: 1px solid #fecdd3; cursor: pointer; border-radius: 999px;
+        border: 1px solid #fecdd3; cursor: grab; border-radius: 999px;
         padding: 6px 12px; font-size: 11px; font-weight: 700;
         color: #be123c; background: #fff;
         box-shadow: 0 4px 12px rgba(244,114,182,0.18);
-        white-space: nowrap;
+        white-space: nowrap; user-select: none;
       }
+      #arya-input-fab.dragging button,
+      #arya-input-fab button:active { cursor: grabbing; }
       #arya-input-fab button:disabled { opacity: 0.65; cursor: wait; }
       #arya-input-fab button:hover:not(:disabled) { background: #fff1f2; }
     `;
@@ -2188,28 +2197,120 @@
     floatBallEl = ball;
   }
 
+  function clampInputFabOffset(offset) {
+    const x = Number(offset?.x);
+    const y = Number(offset?.y);
+    return {
+      x: Number.isFinite(x) ? Math.max(-480, Math.min(480, x)) : 0,
+      y: Number.isFinite(y) ? Math.max(-480, Math.min(480, y)) : 0
+    };
+  }
+
+  async function loadInputFabDragOffset() {
+    if (inputFabOffsetLoaded) return;
+    inputFabOffsetLoaded = true;
+    try {
+      const stored = await chrome.storage.local.get(INPUT_FAB_OFFSET_KEY);
+      const saved = stored?.[INPUT_FAB_OFFSET_KEY];
+      if (saved && typeof saved === 'object') {
+        inputFabDragOffset = clampInputFabOffset(saved);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function saveInputFabDragOffset() {
+    const payload = clampInputFabOffset(inputFabDragOffset);
+    inputFabDragOffset = payload;
+    try {
+      chrome.storage.local.set({ [INPUT_FAB_OFFSET_KEY]: payload });
+    } catch {
+      // ignore
+    }
+  }
+
   function getEditableValue(el) {
     if (!el) return '';
     if (el.isContentEditable) return (el.innerText || el.textContent || '').trim();
     return String(el.value || '').trim();
   }
 
+  function setContentEditableValue(el, value) {
+    el.focus({ preventScroll: true });
+    try {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const inserted = document.execCommand('insertText', false, value);
+      if (!inserted) {
+        el.textContent = value;
+      }
+    } catch {
+      el.textContent = value;
+    }
+    try {
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: 'insertReplacementText',
+        data: value
+      }));
+    } catch {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  }
+
   function setEditableValue(el, value) {
     if (!el) return;
     if (el.isContentEditable) {
-      el.focus();
-      el.textContent = value;
-      el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      setContentEditableValue(el, value);
       return;
     }
+
+    const next = String(value ?? '');
+    const prev = String(el.value ?? '');
     const proto = el.tagName === 'TEXTAREA'
       ? window.HTMLTextAreaElement.prototype
       : window.HTMLInputElement.prototype;
     const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (descriptor?.set) descriptor.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // React 受控输入：先让 _valueTracker 记住旧值，再写入新值并派发 input，状态才能同步，否则译回后删改无效
+    try {
+      const tracker = el._valueTracker;
+      if (tracker) tracker.setValue(prev);
+    } catch {
+      // ignore
+    }
+
+    if (descriptor?.set) descriptor.set.call(el, next);
+    else el.value = next;
+
+    try {
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: 'insertReplacementText',
+        data: next
+      }));
+    } catch {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
     el.dispatchEvent(new Event('change', { bubbles: true }));
+
+    try {
+      el.focus({ preventScroll: true });
+      const len = String(el.value ?? '').length;
+      if (typeof el.setSelectionRange === 'function') {
+        el.setSelectionRange(len, len);
+      }
+    } catch {
+      // ignore
+    }
   }
 
   function isSupportedEditable(el) {
@@ -2233,22 +2334,61 @@
     if (inputFabEl) inputFabEl.style.display = 'none';
   }
 
+  function getInputFabDefaultPos(el) {
+    const rect = el.getBoundingClientRect();
+    const top = Math.min(Math.max(rect.top + 4, 8), window.innerHeight - 36);
+    const left = Math.min(Math.max(rect.right - 78, 8), window.innerWidth - 86);
+    return { top, left, valid: rect.width >= 40 && rect.height >= 18 };
+  }
+
   function positionInputFab(el) {
     if (!inputFabEl || !el) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width < 40 || rect.height < 18) {
+    const pos = getInputFabDefaultPos(el);
+    if (!pos.valid) {
       inputFabEl.style.display = 'none';
       return;
     }
-    const top = Math.min(Math.max(rect.top + 4, 8), window.innerHeight - 36);
-    const left = Math.min(Math.max(rect.right - 78, 8), window.innerWidth - 86);
+    const top = Math.min(Math.max(pos.top + inputFabDragOffset.y, 4), window.innerHeight - 40);
+    const left = Math.min(Math.max(pos.left + inputFabDragOffset.x, 4), window.innerWidth - 72);
     inputFabEl.style.top = `${top}px`;
     inputFabEl.style.left = `${left}px`;
     inputFabEl.style.display = 'block';
   }
 
+  async function runInputFabTranslate(btn) {
+    const target = inputFabTarget;
+    if (!target || !isSupportedEditable(target)) return;
+    const source = getEditableValue(target);
+    if (!source || source.length < 1) {
+      showOverlay('输入框里还没有可翻译的文字', 0);
+      setTimeout(hideOverlay, 1400);
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      const settings = await getSettings();
+      const targetLang = resolveMutualTargetLang(source, settings.targetLang);
+      const [translated] = await translatePreviewTexts([source], targetLang);
+      const next = (translated || '').trim();
+      if (!next) throw new Error('未返回译文');
+      setEditableValue(target, next);
+      showOverlay(`输入框已译为 ${targetLang}`, 100);
+      setTimeout(hideOverlay, 1400);
+    } catch (error) {
+      showOverlay(error.message || '输入框翻译失败', 0);
+      setTimeout(hideOverlay, 2000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '译';
+      if (inputFabTarget) positionInputFab(inputFabTarget);
+    }
+  }
+
   async function ensureInputFab() {
     await getSettings();
+    await loadInputFabDragOffset();
     if (!uiFeatureFlags.showInputTranslate) {
       hideInputFab();
       if (inputFabEl) {
@@ -2262,45 +2402,58 @@
 
     const fab = document.createElement('div');
     fab.id = 'arya-input-fab';
-    fab.innerHTML = '<button type="button" title="翻译当前输入框">译</button>';
+    fab.innerHTML = '<button type="button" title="翻译当前输入框（可拖动）">译</button>';
     const btn = fab.querySelector('button');
 
-    btn.addEventListener('mousedown', (e) => {
+    btn.addEventListener('pointerdown', (e) => {
+      if (e.button != null && e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
-    });
-
-    btn.addEventListener('click', async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const target = inputFabTarget;
-      if (!target || !isSupportedEditable(target)) return;
-      const source = getEditableValue(target);
-      if (!source || source.length < 1) {
-        showOverlay('输入框里还没有可翻译的文字', 0);
-        setTimeout(hideOverlay, 1400);
-        return;
-      }
-
-      btn.disabled = true;
-      btn.textContent = '…';
+      inputFabDragMoved = false;
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const origin = { ...inputFabDragOffset };
+      const pointerId = e.pointerId;
       try {
-        const settings = await getSettings();
-        const targetLang = resolveMutualTargetLang(source, settings.targetLang);
-        const [translated] = await translatePreviewTexts([source], targetLang);
-        const next = (translated || '').trim();
-        if (!next) throw new Error('未返回译文');
-        setEditableValue(target, next);
-        showOverlay(`输入框已译为 ${targetLang}`, 100);
-        setTimeout(hideOverlay, 1400);
-      } catch (error) {
-        showOverlay(error.message || '输入框翻译失败', 0);
-        setTimeout(hideOverlay, 2000);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = '译';
-        if (inputFabTarget) positionInputFab(inputFabTarget);
+        btn.setPointerCapture(pointerId);
+      } catch {
+        // ignore
       }
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (!inputFabDragMoved && (Math.abs(dx) > 4 || Math.abs(dy) > 4)) {
+          inputFabDragMoved = true;
+          fab.classList.add('dragging');
+        }
+        if (!inputFabDragMoved) return;
+        inputFabDragOffset = { x: origin.x + dx, y: origin.y + dy };
+        if (inputFabTarget) positionInputFab(inputFabTarget);
+      };
+
+      const onUp = (ev) => {
+        btn.removeEventListener('pointermove', onMove);
+        btn.removeEventListener('pointerup', onUp);
+        btn.removeEventListener('pointercancel', onUp);
+        try {
+          btn.releasePointerCapture(pointerId);
+        } catch {
+          // ignore
+        }
+        fab.classList.remove('dragging');
+        if (inputFabDragMoved) {
+          saveInputFabDragOffset();
+        } else {
+          runInputFabTranslate(btn);
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+      };
+
+      btn.addEventListener('pointermove', onMove);
+      btn.addEventListener('pointerup', onUp);
+      btn.addEventListener('pointercancel', onUp);
     });
 
     document.documentElement.appendChild(fab);
