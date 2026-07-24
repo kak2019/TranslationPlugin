@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Arya Translate - AI Web Translator",
-  "version": "2.4.2",
+  "version": "2.4.3",
   "description": "免费 AI 网页翻译，支持 Qwen-MT 开箱即用。以爱连接每一种语言。",
   "permissions": [
     "storage",

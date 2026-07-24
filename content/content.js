@@ -152,7 +152,10 @@
   // 营销站常见「演示区 / 导航」跳过；与用户 siteRules.skipSelectors 合并
   const BUILTIN_SKIP_BY_HOST = {
     'cursor.com':
-      'nav, header, footer, [role="navigation"], [role="banner"], [role="menubar"], [aria-hidden="true"]'
+      'nav, header, footer, [role="navigation"], [role="banner"], [role="menubar"], [aria-hidden="true"]',
+    // Microsoft Learn：跳过反馈栏（含点赞），避免 flex 行被双语撑出大空白
+    'learn.microsoft.com':
+      '#site-user-feedback-footer, #ms--site-user-feedback-right-rail, #user-feedback, [data-bi-name*="feedback"], [data-test-id*="feedback"], [data-test-id*="rating"], .thumb-rating-button, [data-binary-rating-response]'
   };
 
   function getBuiltinSkipSelectors(hostname) {
@@ -604,6 +607,25 @@
     return null;
   }
 
+  /** 光标是否落在文本节点的非空白字形上（空白/页外不显示原文提示） */
+  function isPointOverTextNode(node, x, y) {
+    if (!node || node.nodeType !== Node.TEXT_NODE) return false;
+    const text = node.textContent || '';
+    if (!text.trim()) return false;
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rects = range.getClientRects();
+      for (const r of rects) {
+        if (r.width <= 0 || r.height <= 0) continue;
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return true;
+      }
+    } catch {
+      // ignore
+    }
+    return false;
+  }
+
   function getBilingualOriginalFromEl(el) {
     if (!el) return '';
     const wrap = el.closest?.('.arya-bilingual, [data-arya-bilingual="1"]') || (
@@ -615,20 +637,31 @@
 
   /** 悬停原文提示：优先整段原文（双语 / 替换模式块），避免链接拆句后只显示末尾碎片 */
   function resolveOriginalForHover(clientX, clientY, target) {
+    // 必须落在真实文字上：空白区 / padding / 页外不弹
+    const textNode = resolveTextNodeAtPoint(clientX, clientY);
+    const onBiEl = target?.closest?.('.arya-bilingual, [data-arya-bilingual="1"]');
+    if (!onBiEl && !isPointOverTextNode(textNode, clientX, clientY)) {
+      return null;
+    }
+
     try {
       const hit = document.elementFromPoint(clientX, clientY) || target;
       const fromBi = getBilingualOriginalFromEl(hit);
       if (fromBi) return { original: fromBi, key: `bi:${fromBi.slice(0, 48)}` };
-      const replaced = hit?.closest?.('[data-arya-original][data-arya-replaced="1"]');
-      const replacedOriginal = (replaced?.getAttribute('data-arya-original') || '').trim();
-      if (replacedOriginal) {
-        return { original: replacedOriginal, key: `rep:${replacedOriginal.slice(0, 48)}` };
+
+      // 替换模式：仅当命中点落在带原文标记的容器内的文字上才提示
+      if (textNode?.parentElement) {
+        const replaced = textNode.parentElement.closest?.('[data-arya-original][data-arya-replaced="1"]');
+        const replacedOriginal = (replaced?.getAttribute('data-arya-original') || '').trim();
+        if (replacedOriginal) {
+          return { original: replacedOriginal, key: `rep:${replacedOriginal.slice(0, 48)}` };
+        }
       }
     } catch {
       // ignore
     }
 
-    const node = resolveTextNodeAtPoint(clientX, clientY);
+    const node = textNode;
     if (!node) return null;
 
     const host = findInteractiveHost(node);
@@ -661,6 +694,15 @@
   function onOriginalTooltipMove(e) {
     if (originalTooltipRaf) return;
     const { clientX, clientY, target } = e;
+    // 移出视口：直接隐藏
+    if (
+      clientX < 0 || clientY < 0
+      || clientX > window.innerWidth
+      || clientY > window.innerHeight
+    ) {
+      hideOriginalTooltip();
+      return;
+    }
     originalTooltipRaf = requestAnimationFrame(() => {
       originalTooltipRaf = null;
       // 双语译文本身要能提示原文；其它插件 UI 仍忽略
@@ -671,7 +713,7 @@
       }
       const resolved = resolveOriginalForHover(clientX, clientY, target);
       if (!resolved?.original) {
-        if (lastTooltipNode) hideOriginalTooltip();
+        hideOriginalTooltip();
         return;
       }
       const tip = ensureOriginalTooltip();
@@ -727,7 +769,7 @@
     return clientRects[clientRects.length - 1];
   }
 
-  function scheduleSelectionBubble() {
+  function scheduleSelectionBubble(options = {}) {
     if (selectionBubbleRaf) {
       cancelAnimationFrame(selectionBubbleRaf);
       selectionBubbleRaf = null;
@@ -744,19 +786,39 @@
       selectionBubbleTimer = null;
       selectionBubbleRaf = requestAnimationFrame(() => {
         selectionBubbleRaf = null;
-        showSelectionBubble();
+        showSelectionBubble(options);
       });
     }, delay);
   }
 
   function onSelectionScroll() {
-    const snap = getActiveSelectionSnapshot();
+    let snap = getActiveSelectionSnapshot();
+    // 滚动时个别站点会短暂丢掉选区；翻译框已开则用缓存选区继续跟随
+    if (!snap && selectionPanelEl && cachedSelection?.range) {
+      try {
+        const range = cachedSelection.range;
+        if (document.documentElement.contains(
+          range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+            ? range.commonAncestorContainer
+            : range.commonAncestorContainer.parentElement
+        )) {
+          snap = {
+            text: cachedSelection.text,
+            range,
+            allowApply: !isSelectionInEditableContext(range)
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
     if (!snap) {
       hideSelectionBubble();
       return;
     }
     cachedSelection = { text: snap.text, range: snap.range };
-    scheduleSelectionBubble();
+    // 翻译框已打开时：滚动只跟随重定位，不关闭面板
+    scheduleSelectionBubble({ keepPanel: Boolean(selectionPanelEl) });
   }
 
   function positionSelectionPanel(panel, anchorRect) {
@@ -790,25 +852,18 @@
       e.preventDefault();
       e.stopPropagation();
     });
-    panel.addEventListener('mouseenter', () => {
-      if (selectionPanelHideTimer) {
-        clearTimeout(selectionPanelHideTimer);
-        selectionPanelHideTimer = null;
-      }
-    });
-    panel.addEventListener('mouseleave', () => {
-      scheduleHideSelectionPanel();
-    });
+    // 面板打开后保持显示，直到点击空白处（不再因 mouseleave 自动消失）
     document.documentElement.appendChild(panel);
     selectionPanelEl = panel;
     return panel;
   }
 
   function scheduleHideSelectionPanel() {
-    if (selectionPanelHideTimer) clearTimeout(selectionPanelHideTimer);
-    selectionPanelHideTimer = setTimeout(() => {
-      hideSelectionPanel();
-    }, 220);
+    // 保留函数供兼容；面板改为点击空白关闭，不再自动延时隐藏
+    if (selectionPanelHideTimer) {
+      clearTimeout(selectionPanelHideTimer);
+      selectionPanelHideTimer = null;
+    }
   }
 
   async function showSelectionPreviewPanel(sourceText, anchorRect, allowApply) {
@@ -960,7 +1015,7 @@
       // 高亮已变、粉点仍是旧文案：先按新选区重建再预览
       if (live.text !== bound) {
         cachedSelection = { text: live.text, range: live.range };
-        showSelectionBubble({ openPreview: true });
+        showSelectionBubble({ openPreview: true, keepPanel: true });
         return;
       }
       cachedSelection = { text: live.text, range: live.range };
@@ -973,9 +1028,7 @@
       e.stopPropagation();
     });
     dot.addEventListener('mouseenter', openPanel);
-    dot.addEventListener('mouseleave', () => {
-      scheduleHideSelectionPanel();
-    });
+    // 面板打开后不因离开粉点而关闭；点击空白处再关
     dot.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -984,6 +1037,11 @@
 
     document.documentElement.appendChild(bubble);
     selectionBubbleEl = bubble;
+
+    // 滚动重建粉点时：翻译框仍在则跟着粉点重定位
+    if (options.keepPanel && selectionPanelEl) {
+      positionSelectionPanel(selectionPanelEl, dot.getBoundingClientRect());
+    }
 
     if (options.openPreview) {
       requestAnimationFrame(() => {
@@ -997,7 +1055,11 @@
   document.addEventListener('scroll', onSelectionScroll, true);
   document.addEventListener('mousemove', onOriginalTooltipMove, true);
   document.addEventListener('scroll', hideOriginalTooltip, true);
+  document.addEventListener('mouseleave', hideOriginalTooltip, true);
+  window.addEventListener('blur', hideOriginalTooltip);
+  document.documentElement.addEventListener('mouseleave', hideOriginalTooltip);
   document.addEventListener('mousedown', (e) => {
+    // 点击空白处关闭粉点与翻译框；点在粉点/面板上则保留
     if (!isOurBubbleElement(e.target)) hideSelectionBubble();
   }, true);
 
@@ -1225,10 +1287,40 @@
     bilingualElements.delete(node);
   }
 
+  function isFeedbackUiElement(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    try {
+      return Boolean(el.closest(
+        [
+          '#site-user-feedback-footer',
+          '#ms--site-user-feedback-right-rail',
+          '#user-feedback',
+          '[data-bi-name*="feedback" i]',
+          '[data-test-id*="feedback" i]',
+          '[data-test-id*="rating" i]',
+          '.thumb-rating-button',
+          '[data-binary-rating-response]'
+        ].join(', ')
+      ));
+    } catch {
+      // 部分选择器不支持时，退回 id / 属性粗匹配
+      try {
+        return Boolean(
+          el.closest('#site-user-feedback-footer, #ms--site-user-feedback-right-rail, #user-feedback')
+          || el.closest('.thumb-rating-button, [data-binary-rating-response]')
+          || el.closest('[data-bi-name*="feedback"], [data-test-id*="feedback"], [data-test-id*="rating"]')
+        );
+      } catch {
+        return false;
+      }
+    }
+  }
+
   function shouldSkipElement(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
     if (isOurOverlayElement(el)) return true;
     if (el.getAttribute('translate') === 'no') return true;
+    if (isFeedbackUiElement(el)) return true;
     for (const cls of el.classList || []) {
       if (SKIP_ANCESTOR_CLASSES.has(cls)) return true;
     }
@@ -2509,10 +2601,11 @@
     setFloatBallTranslating(isTranslating || isProcessingIncremental);
   }
 
+  // 不要把 ARTICLE/MAIN 当段落块：整页并成一个单元后，写回会清空其余节点 → 翻译中页面「消失」
   const PARA_BLOCK_TAGS = new Set([
     'P', 'LI', 'DD', 'DT', 'BLOCKQUOTE', 'FIGCAPTION',
     'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
-    'TD', 'TH', 'ARTICLE'
+    'TD', 'TH'
   ]);
 
   function hasBlockLevelChild(el) {
@@ -2653,13 +2746,37 @@
     while (el && el !== document.body && el !== document.documentElement) {
       if (shouldSkipElement(el)) return null;
       if (isCompactTranslationContext(el)) return null;
+      // 地标容器过大，不能当翻译块
+      if (el.tagName === 'ARTICLE' || el.tagName === 'MAIN' || el.tagName === 'HEADER' || el.tagName === 'FOOTER') {
+        el = el.parentElement;
+        continue;
+      }
       if (PARA_BLOCK_TAGS.has(el.tagName)) return el;
       if ((el.tagName === 'DIV' || el.tagName === 'SECTION') && !hasBlockLevelChild(el)) {
+        // 避免把整页 content 包装 div 当块
+        if (el.childElementCount > 8) {
+          el = el.parentElement;
+          continue;
+        }
         if (!divFallback) divFallback = el;
       }
       el = el.parentElement;
     }
     return divFallback;
+  }
+
+  /** 最近的「原子」段落块：防止跨段落合并后写回清空整页 */
+  function findAtomicBlock(node) {
+    let el = node?.parentElement;
+    while (el && el !== document.body && el !== document.documentElement) {
+      if (PARA_BLOCK_TAGS.has(el.tagName)) return el;
+      if ((el.tagName === 'DIV' || el.tagName === 'SECTION') && !hasBlockLevelChild(el) && el.childElementCount <= 8) {
+        return el;
+      }
+      if (el.tagName === 'ARTICLE' || el.tagName === 'MAIN') return null;
+      el = el.parentElement;
+    }
+    return null;
   }
 
   /**
@@ -2795,17 +2912,48 @@
         continue;
       }
 
-      if (ordered.length > 48 || unitText.length > 4500) {
-        for (const node of ordered) {
-          const t = (node.textContent || '').trim();
-          if (!t || isLikelyNonTranslatable(t)) continue;
-          units.push({
-            __aryaUnit: true,
-            kind: 'node',
-            node,
-            nodes: [node],
-            text: t
-          });
+      // 超大块或跨多个原子段落：拆开，避免写回时清空整页
+      const atomicGroups = new Map();
+      for (const node of ordered) {
+        const atomic = findAtomicBlock(node) || node.parentElement || block;
+        if (!atomicGroups.has(atomic)) atomicGroups.set(atomic, []);
+        atomicGroups.get(atomic).push(node);
+      }
+      const tooLarge = ordered.length > 16 || unitText.length > 900 || atomicGroups.size > 1;
+      if (tooLarge) {
+        for (const [atomic, groupNodes] of atomicGroups) {
+          const groupOrdered = [...new Set(groupNodes)].sort(compareDocumentOrder);
+          const groupText = joinBlockTextInOrder(groupOrdered);
+          if (!groupText || isLikelyNonTranslatable(groupText)) continue;
+          if (groupOrdered.length === 1) {
+            units.push({
+              __aryaUnit: true,
+              kind: 'node',
+              node: groupOrdered[0],
+              nodes: groupOrdered,
+              text: groupText
+            });
+          } else if (groupText.length > 900 || groupOrdered.length > 16) {
+            for (const node of groupOrdered) {
+              const t = (node.textContent || '').trim();
+              if (!t || isLikelyNonTranslatable(t)) continue;
+              units.push({
+                __aryaUnit: true,
+                kind: 'node',
+                node,
+                nodes: [node],
+                text: t
+              });
+            }
+          } else {
+            units.push({
+              __aryaUnit: true,
+              kind: 'block',
+              block: atomic,
+              nodes: groupOrdered,
+              text: groupText
+            });
+          }
         }
         continue;
       }
@@ -3168,6 +3316,8 @@
   function shouldSkipBilingualUi(el, text) {
     const t = String(text || '').replace(/\s+/g, ' ').trim();
     if (!t) return true;
+    // 反馈栏：不挂双语（也不应被收集；双保险）
+    if (isFeedbackUiElement(el)) return true;
     // 侧栏 / TOC / 导航：双语会撑宽窄栏导致横向滚动，整区跳过
     if (isCompactTranslationContext(el)) return true;
     if (el?.closest?.('[role="menuitem"], [role="tab"], [role="toolbar"]') && t.length <= 28) {
@@ -3466,10 +3616,19 @@
   /** 替换模式：多文本节点（常因行内链接拆开）整段一次写入，悬停可还原整句 */
   function applyReplaceFragmentTranslation(nodes, translated, original) {
     if (!isValidTranslation(translated)) return;
-    const ordered = [...new Set(nodes || [])]
+    let ordered = [...new Set(nodes || [])]
       .filter((n) => n?.isConnected)
       .sort(compareDocumentOrder);
     if (!ordered.length) return;
+
+    // 安全网：若节点分属不同段落，只改写各自段落内节点，禁止跨段清空
+    const firstAtomic = findAtomicBlock(ordered[0]);
+    if (firstAtomic) {
+      const sameAtomic = ordered.filter((n) => findAtomicBlock(n) === firstAtomic);
+      if (sameAtomic.length && sameAtomic.length < ordered.length) {
+        ordered = sameAtomic;
+      }
+    }
 
     // 每个节点只存自己的原文碎片；整句留给 data-arya-original 做悬停。
     // 若把整句写进 first 的 translatedNodes，恢复时其它碎片再还原 → 原文重复。
@@ -3492,7 +3651,7 @@
       const first = ordered[0];
       first.textContent = translated;
 
-      const anchorEl = first.parentElement || findTranslationBlock(first);
+      const anchorEl = firstAtomic || first.parentElement || findTranslationBlock(first);
       if (anchorEl) markReplacedOriginal(anchorEl, fullOriginal);
 
       for (let i = 1; i < ordered.length; i++) {
@@ -4249,6 +4408,7 @@
       activeSettings = settings;
 
       // 已翻译时再点「翻译此页」：先恢复，再按当前模式（含双语）重译
+      // 不在恢复后 yield，避免整页闪白（恢复→yield 重绘英文→再译中文）
       const alreadyTranslated = isPageTranslationActive()
         || Boolean(document.querySelector('.arya-bilingual, [data-arya-bilingual="1"]'));
       if (alreadyTranslated) {
@@ -4257,7 +4417,6 @@
           5
         );
         restoreOriginal();
-        await yieldToMain();
       }
 
       const scannedNodes = await collectTextNodesAsync((msg) => {
