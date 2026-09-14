@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arya Translate — 单词本</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      background: linear-gradient(180deg, #fff7f9 0%, #f7f8fb 220px, #f7f8fb 100%);
+      color: #0f172a; padding: 40px 20px;
+    }
+    .wrap { max-width: 720px; margin: 0 auto; }
+    .page-header {
+      display: flex; align-items: center; gap: 14px; margin-bottom: 10px;
+    }
+    .page-mark {
+      width: 44px; height: 44px; border-radius: 50%;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: linear-gradient(145deg, #fda4af, #f4729b 55%, #fb7185);
+      color: #fff; font-size: 18px; font-weight: 800;
+      box-shadow: 0 8px 18px rgba(244,114,155,0.28);
+      position: relative; flex-shrink: 0;
+    }
+    .page-mark::before {
+      content: "✦"; position: absolute; top: 5px; left: 7px; font-size: 8px;
+    }
+    h1 { font-size: 26px; margin-bottom: 2px; color: #e11d48; letter-spacing: -0.3px; }
+    h2 {
+      font-size: 15px; margin-bottom: 14px; color: #0f172a;
+      display: flex; align-items: center; gap: 8px;
+    }
+    h2::before {
+      content: ""; width: 6px; height: 16px; border-radius: 99px;
+      background: linear-gradient(180deg, #fb7185, #f43f5e);
+    }
+    .desc { color: #64748b; font-size: 14px; margin-bottom: 18px; line-height: 1.65; }
+    .nav-link { color: #f43f5e; text-decoration: none; font-weight: 600; font-size: 13px; }
+    .nav-link:hover { text-decoration: underline; }
+    .card {
+      background: #fff; border-radius: 18px; padding: 22px 24px;
+      border: 1px solid #f1f5f9;
+      box-shadow: 0 8px 24px rgba(15,23,42,0.04); margin-bottom: 16px;
+    }
+    .field { margin-bottom: 18px; }
+    .field:last-child { margin-bottom: 0; }
+    label { display: block; font-size: 13px; font-weight: 650; margin-bottom: 7px; color: #334155; }
+    .hint { font-size: 12px; color: #94a3b8; margin-top: 5px; line-height: 1.55; }
+    input {
+      width: 100%; padding: 11px 12px; border: 1px solid #eef2f7;
+      border-radius: 12px; font-size: 14px; outline: none; background: #f8fafc; color: #0f172a;
+    }
+    input:focus {
+      border-color: #fda4af; background: #fff;
+      box-shadow: 0 0 0 3px rgba(253,164,175,0.22);
+    }
+    button {
+      padding: 11px 22px; background: #f43f5e;
+      color: #fff; border: none; border-radius: 12px; font-size: 14px;
+      font-weight: 700; cursor: pointer;
+      box-shadow: 0 8px 18px rgba(244,63,94,0.22);
+    }
+    button:hover { background: #e11d48; }
+    .btn-secondary {
+      background: #fff; color: #be123c; border: 1px solid #fecdd3;
+      box-shadow: none; padding: 8px 14px; font-size: 13px;
+    }
+    .btn-secondary:hover { background: #fff1f2; }
+    .list-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
+    .inline-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 520px) { .inline-fields { grid-template-columns: 1fr; } }
+    .wordbook-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .wordbook-toolbar input { flex: 1; min-width: 180px; margin: 0; }
+    .wordbook-meta { font-size: 12px; color: #94a3b8; margin-bottom: 8px; }
+    .wordbook-list {
+      max-height: 560px; overflow: auto; border: 1px solid #eef2f7;
+      border-radius: 14px; background: #f8fafc;
+    }
+    .wordbook-empty { padding: 18px 14px; font-size: 13px; color: #94a3b8; text-align: center; }
+    .wordbook-row {
+      display: grid; grid-template-columns: 1.1fr 1fr auto; gap: 8px;
+      align-items: center; padding: 12px 14px; border-bottom: 1px solid #eef2f7;
+    }
+    .wordbook-row:last-child { border-bottom: none; }
+    .wordbook-en { font-weight: 650; font-size: 15px; color: #0f172a; word-break: break-word; }
+    .wordbook-zh { font-size: 14px; color: #64748b; word-break: break-word; }
+    .wordbook-source {
+      display: inline-block; margin-top: 4px; font-size: 11px; color: #f43f5e;
+      text-decoration: none; font-weight: 600; max-width: 100%;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .wordbook-source:hover { text-decoration: underline; }
+    .wordbook-actions { display: flex; gap: 4px; }
+    .wordbook-actions button {
+      padding: 6px 8px; font-size: 12px; box-shadow: none;
+      background: #fff; color: #be123c; border: 1px solid #fecdd3;
+    }
+    .wordbook-actions button:hover { background: #fff1f2; }
+    .review-en {
+      font-size: 28px; font-weight: 800; color: #0f172a; letter-spacing: -0.4px;
+      margin: 8px 0 14px; word-break: break-word;
+    }
+    .review-zh {
+      min-height: 44px; padding: 12px 14px; border-radius: 12px;
+      background: #fff1f2; color: #9f1239; font-size: 16px; font-weight: 650;
+      margin-bottom: 14px;
+    }
+    .review-zh.masked {
+      color: transparent; text-shadow: 0 0 12px #9f1239;
+      user-select: none; cursor: pointer;
+    }
+    .save-status { font-size: 13px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="page-header">
+      <div class="page-mark" aria-hidden="true">A</div>
+      <div>
+        <h1>单词本</h1>
+        <p class="desc" style="margin-bottom:0;font-size:13px">划词收录的英文单词与中文译文</p>
+      </div>
+    </div>
+    <p class="desc">
+      在网页上划选英文单词，悬停粉点即可自动加入。
+      <a class="nav-link" href="../options/options.html">返回设置</a>
+    </p>
+
+    <div class="card">
+      <div class="wordbook-toolbar">
+        <input type="search" id="wordbookSearch" placeholder="搜索英文或译文" autocomplete="off">
+        <button type="button" class="btn-secondary" id="reviewStartBtn">遮中文复习</button>
+        <button type="button" class="btn-secondary" id="exportJsonBtn">导出 JSON</button>
+        <button type="button" class="btn-secondary" id="exportCsvBtn">导出 CSV</button>
+      </div>
+      <div class="wordbook-meta" id="wordbookMeta">共 0 条</div>
+      <div class="wordbook-list" id="wordbookList">
+        <div class="wordbook-empty">还没有单词。在网页上划选英文单词，悬停粉点即可收录。</div>
+      </div>
+    </div>
+
+    <div class="card" id="reviewCard" hidden>
+      <h2>遮住中文复习</h2>
+      <p class="hint" style="margin-bottom:8px">先看英文，想起来再点显示中文。下一条会随机抽词。</p>
+      <div class="review-en" id="reviewEn">—</div>
+      <div class="review-zh masked" id="reviewZh">点击显示中文</div>
+      <div class="list-actions">
+        <button type="button" id="reviewRevealBtn">显示中文</button>
+        <button type="button" class="btn-secondary" id="reviewSpeakBtn">朗读英文</button>
+        <button type="button" class="btn-secondary" id="reviewNextBtn">下一条</button>
+        <button type="button" class="btn-secondary" id="reviewExitBtn">退出复习</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>可选：同步到自己的阿里云 OSS</h2>
+      <p class="hint" style="margin-bottom:12px">
+        不填则只保存在本机浏览器。填写后，词本会由插件后台上传到你自己的 Bucket。
+        请使用有该 Bucket 读写权限的 AccessKey；地域需与 Bucket 一致，例如 <code>oss-cn-beijing</code>。
+      </p>
+      <div class="field inline-fields">
+        <div>
+          <label for="ossBucket">Bucket</label>
+          <input type="text" id="ossBucket" placeholder="my-bucket" autocomplete="off">
+        </div>
+        <div>
+          <label for="ossRegion">Region</label>
+          <input type="text" id="ossRegion" placeholder="oss-cn-beijing" autocomplete="off">
+        </div>
+      </div>
+      <div class="field inline-fields">
+        <div>
+          <label for="ossAccessKeyId">AccessKey ID</label>
+          <input type="password" id="ossAccessKeyId" placeholder="留空则不同步" autocomplete="off">
+        </div>
+        <div>
+          <label for="ossAccessKeySecret">AccessKey Secret</label>
+          <input type="password" id="ossAccessKeySecret" placeholder="留空则不同步" autocomplete="off">
+        </div>
+      </div>
+      <div class="field">
+        <label for="ossObjectKey">对象路径</label>
+        <input type="text" id="ossObjectKey" placeholder="arya-translate/wordbook.json" autocomplete="off">
+      </div>
+      <div class="list-actions">
+        <button type="button" id="ossSaveBtn">保存同步设置</button>
+        <button type="button" class="btn-secondary" id="wordbookSyncBtn">立即同步</button>
+        <span id="wordbookSyncStatus" class="hint save-status"></span>
+      </div>
+    </div>
+  </div>
+  <script src="wordbook.js"></script>
+</body>
+</html>

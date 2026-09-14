@@ -1,4 +1,4 @@
-importScripts('shared/afdian.js', 'shared/hosted-key.js', 'shared/models.js', 'shared/providers.js');
+importScripts('shared/afdian.js', 'shared/hosted-key.js', 'shared/models.js', 'shared/providers.js', 'shared/wordbook.js');
 
 async function getEffectiveBailianApiKeys(config) {
   const userKeys = getBailianApiKeys(config);
@@ -50,7 +50,12 @@ const DEFAULT_CONFIG = {
   glossary: [],
   siteRules: [],
   selectionDelayMs: 280,
-  selectionMinLength: 4
+  selectionMinLength: 4,
+  ossBucket: '',
+  ossRegion: '',
+  ossAccessKeyId: '',
+  ossAccessKeySecret: '',
+  ossObjectKey: 'arya-translate/wordbook.json'
 };
 
 const MT_MAX_CONCURRENT = 4;
@@ -64,7 +69,15 @@ const MT_FETCH_TIMEOUT_MS = 45000;
 const MT_MESSAGE_TIMEOUT_MS = 90000;
 const CACHE_MAX_ENTRIES = 800;
 const GLOSSARY_MAX_ENTRIES = 80;
+/** 用户术语优先；仅当目标语为中文时启用。 */
+const BUILTIN_GLOSSARY_ZH = [
+  { from: 'Antigravity', to: '反重力' },
+  { from: 'anti-gravity', to: '反重力' }
+];
 const SITE_RULES_MAX_ENTRIES = 50;
+const WORDBOOK_STORAGE_KEY = 'wordbookEntries';
+const OSS_PUSH_DEBOUNCE_MS = 3000;
+const OSS_BOOT_PULL_MIN_MS = 60000;
 
 const mtSlotQueue = { running: 0, waiters: [] };
 let lastMtRequestAt = 0;
@@ -102,6 +115,44 @@ function normalizeGlossary(raw) {
     if (out.length >= GLOSSARY_MAX_ENTRIES) break;
   }
   return out;
+}
+
+function mergeBuiltinGlossary(userGlossary, targetLang) {
+  const user = normalizeGlossary(userGlossary);
+  if (!AryaWordbook?.isChineseTarget?.(targetLang)) return user;
+  const seen = new Set(user.map((item) => item.from.toLowerCase()));
+  const merged = [...user];
+  for (const item of BUILTIN_GLOSSARY_ZH) {
+    const from = normalizeCacheText(item.from);
+    const to = String(item.to || '').trim();
+    if (!from || !to || seen.has(from.toLowerCase())) continue;
+    seen.add(from.toLowerCase());
+    merged.push({ from, to });
+  }
+  return merged;
+}
+
+function lookupGlossaryExact(glossary, source) {
+  const key = normalizeCacheText(source);
+  if (!key) return null;
+  for (const item of glossary) {
+    if (item.from === key) return item.to;
+  }
+  const lower = key.toLowerCase();
+  for (const item of glossary) {
+    if (item.from.toLowerCase() === lower) return item.to;
+  }
+  return null;
+}
+
+function isImplausibleTranslation(source, translated, targetLang) {
+  if (!AryaWordbook?.isChineseTarget?.(targetLang)) return false;
+  const src = normalizeCacheText(source);
+  const dst = normalizeCacheText(translated);
+  if (!src || !dst) return false;
+  if (src.toLowerCase() === dst.toLowerCase()) return false;
+  if (AryaWordbook.hasChinese(dst)) return false;
+  return AryaWordbook.isLatinDominant(src) && AryaWordbook.isLatinDominant(dst);
 }
 
 function normalizeSiteRules(raw) {
@@ -178,11 +229,22 @@ async function getCachedTranslation(text, targetLang, model) {
   return null;
 }
 
+async function forgetCachedTranslation(text, targetLang, model) {
+  const key = cacheStorageKey(text, targetLang, model);
+  memTranslationCache.delete(key);
+  try {
+    await chrome.storage.local.remove(key);
+  } catch {
+    // ignore
+  }
+}
+
 async function setCachedTranslation(text, targetLang, model, translation) {
   const source = normalizeCacheText(text);
   const translated = String(translation || '').trim();
   if (!source || !translated) return;
   if (normalizeCacheText(translated) === source) return;
+  if (isImplausibleTranslation(source, translated, targetLang)) return;
 
   const key = cacheStorageKey(source, targetLang, model);
   touchMemCache(key, translated);
@@ -216,6 +278,301 @@ async function clearTranslationCache() {
   return removed;
 }
 
+let wordbookLock = Promise.resolve();
+let ossPushTimer = null;
+let lastOssPullAt = 0;
+let lastOssError = '';
+
+function withWordbookLock(fn) {
+  const run = wordbookLock.then(fn, fn);
+  wordbookLock = run.then(() => {}, () => {});
+  return run;
+}
+
+async function loadWordbookEntries() {
+  try {
+    const stored = await chrome.storage.local.get(WORDBOOK_STORAGE_KEY);
+    return AryaWordbook.normalizeWordbookEntries(stored[WORDBOOK_STORAGE_KEY]);
+  } catch {
+    return [];
+  }
+}
+
+async function saveWordbookEntries(entries) {
+  const normalized = AryaWordbook.normalizeWordbookEntries(entries);
+  await chrome.storage.local.set({ [WORDBOOK_STORAGE_KEY]: normalized });
+  return normalized;
+}
+
+function getOssConfig(config) {
+  const bucket = String(config?.ossBucket || '').trim();
+  const region = AryaWordbook.normalizeOssRegion(config?.ossRegion || '');
+  const accessKeyId = String(config?.ossAccessKeyId || '').trim();
+  const accessKeySecret = String(config?.ossAccessKeySecret || '').trim();
+  const objectKey = AryaWordbook.normalizeOssObjectKey(config?.ossObjectKey);
+  if (!bucket || !region || !accessKeyId || !accessKeySecret) return null;
+  return { bucket, region, accessKeyId, accessKeySecret, objectKey };
+}
+
+function ossObjectUrl(oss) {
+  return `https://${oss.bucket}.${oss.region}.aliyuncs.com/${oss.objectKey.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+function ossSignRegion(region) {
+  return String(region || '').replace(/^oss-/, '');
+}
+
+function ossIso8601Date(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+    `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}` +
+    `T${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}Z`
+  );
+}
+
+function ossCanonicalUri(oss) {
+  return `/${oss.bucket}/${oss.objectKey}`
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+}
+
+function bufferToHex(buf) {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hmacSha256(key, message) {
+  const keyRaw = typeof key === 'string' ? new TextEncoder().encode(key) : key;
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyRaw,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const msgRaw = typeof message === 'string' ? new TextEncoder().encode(message) : message;
+  return crypto.subtle.sign('HMAC', cryptoKey, msgRaw);
+}
+
+async function sha256Hex(text) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return bufferToHex(hash);
+}
+
+function parseOssError(xml) {
+  const text = String(xml || '');
+  const code = text.match(/<Code>([^<]+)<\/Code>/i)?.[1] || '';
+  const message = text.match(/<Message>([^<]+)<\/Message>/i)?.[1] || '';
+  const snippet = `${code} ${message}`.trim() || text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+  return snippet;
+}
+
+async function ossAuthorizationV4(oss, method, headers) {
+  const isoDate = headers['x-oss-date'];
+  const shortDate = isoDate.slice(0, 8);
+  const region = ossSignRegion(oss.region);
+  const signedHeaders = Object.keys(headers)
+    .map((key) => key.toLowerCase())
+    .filter((key) => key === 'content-type' || key === 'content-md5' || key.startsWith('x-oss-'))
+    .sort();
+  const headerMap = {};
+  Object.entries(headers).forEach(([key, value]) => {
+    headerMap[key.toLowerCase()] = String(value).trim();
+  });
+  const canonicalHeaders = `${signedHeaders.map((key) => `${key}:${headerMap[key]}\n`).join('')}`;
+  const canonicalRequest = [
+    method.toUpperCase(),
+    ossCanonicalUri(oss),
+    '',
+    canonicalHeaders,
+    '',
+    headerMap['x-oss-content-sha256'] || 'UNSIGNED-PAYLOAD'
+  ].join('\n');
+  const hashedRequest = await sha256Hex(canonicalRequest);
+  const credentialScope = `${shortDate}/${region}/oss/aliyun_v4_request`;
+  const stringToSign = ['OSS4-HMAC-SHA256', isoDate, credentialScope, hashedRequest].join('\n');
+  const dateKey = await hmacSha256(`aliyun_v4${oss.accessKeySecret}`, shortDate);
+  const regionKey = await hmacSha256(dateKey, region);
+  const serviceKey = await hmacSha256(regionKey, 'oss');
+  const signingKey = await hmacSha256(serviceKey, 'aliyun_v4_request');
+  const signature = bufferToHex(await hmacSha256(signingKey, stringToSign));
+  return `OSS4-HMAC-SHA256 Credential=${oss.accessKeyId}/${credentialScope},Signature=${signature}`;
+}
+
+async function ossRequest(oss, method, body = null, contentType = '') {
+  // fetch 禁止设置 Date 头。改用 OSS V4：x-oss-date 为 ISO8601，x-oss-content-sha256 为 UNSIGNED-PAYLOAD。
+  const isoDate = ossIso8601Date();
+  const headers = {
+    'x-oss-date': isoDate,
+    'x-oss-content-sha256': 'UNSIGNED-PAYLOAD'
+  };
+  if (method === 'PUT' && contentType) {
+    headers['Content-Type'] = contentType;
+  }
+  headers.Authorization = await ossAuthorizationV4(oss, method, headers);
+  const response = await fetch(ossObjectUrl(oss), {
+    method,
+    headers,
+    body: body || undefined,
+    cache: 'no-store'
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    if (method === 'GET' && response.status === 404) return '';
+    throw new Error(parseOssError(text) || `OSS ${method} 失败（HTTP ${response.status}）`);
+  }
+  return text;
+}
+
+async function pushWordbookToOss(entries) {
+  const config = await getConfig();
+  const oss = getOssConfig(config);
+  if (!oss) return { skipped: true };
+  const payload = JSON.stringify({
+    version: 1,
+    updatedAt: Date.now(),
+    entries: AryaWordbook.normalizeWordbookEntries(entries ?? (await loadWordbookEntries()))
+  });
+  await ossRequest(oss, 'PUT', payload, 'application/json');
+  lastOssError = '';
+  return { skipped: false };
+}
+
+async function pullWordbookFromOss() {
+  const config = await getConfig();
+  const oss = getOssConfig(config);
+  if (!oss) return { skipped: true, entries: await loadWordbookEntries() };
+  const text = await ossRequest(oss, 'GET');
+  if (!text) return { skipped: false, entries: [] };
+  try {
+    const parsed = JSON.parse(text);
+    const remote = Array.isArray(parsed) ? parsed : parsed?.entries;
+    return { skipped: false, entries: AryaWordbook.normalizeWordbookEntries(remote) };
+  } catch {
+    throw new Error('OSS 上的单词本不是合法 JSON');
+  }
+}
+
+function scheduleOssPush() {
+  if (ossPushTimer) clearTimeout(ossPushTimer);
+  ossPushTimer = setTimeout(() => {
+    ossPushTimer = null;
+    pushWordbookToOss().catch((error) => {
+      lastOssError = error.message || 'OSS 上传失败';
+    });
+  }, OSS_PUSH_DEBOUNCE_MS);
+}
+
+async function resolveWordbookZh(en, zhHint) {
+  const hinted = AryaWordbook.pickZh(zhHint, en);
+  if (hinted) return hinted;
+  const source = AryaWordbook.normalizeWordbookText(en);
+  if (!source) return '';
+  try {
+    const { translations } = await translateBatch(
+      [source],
+      `wordbook-${Date.now()}`,
+      null,
+      { targetLang: '简体中文' }
+    );
+    return AryaWordbook.pickZh(translations?.[0], source);
+  } catch {
+    return '';
+  }
+}
+
+async function addWordbookEntry(payload) {
+  const en = AryaWordbook.normalizeWordbookText(payload?.en);
+  const zh = await resolveWordbookZh(en, payload?.zh);
+  return withWordbookLock(async () => {
+    const current = await loadWordbookEntries();
+    const result = AryaWordbook.upsertWordbookEntry(current, {
+      en,
+      zh,
+      sourceUrl: payload?.sourceUrl
+    });
+    await saveWordbookEntries(result.entries);
+    scheduleOssPush();
+    return {
+      success: true,
+      entry: result.entry,
+      added: result.added,
+      updated: result.updated
+    };
+  });
+}
+
+async function fillMissingWordbookZh() {
+  const current = await loadWordbookEntries();
+  const need = current.filter((item) => !AryaWordbook.hasChinese(item.zh));
+  if (!need.length) return { success: true, entries: current, filled: 0 };
+  let translations = [];
+  try {
+    const result = await translateBatch(
+      need.map((item) => item.en),
+      `wordbook-fill-${Date.now()}`,
+      null,
+      { targetLang: '简体中文' }
+    );
+    translations = result.translations || [];
+  } catch (error) {
+    return { success: false, error: error.message, entries: current, filled: 0 };
+  }
+  return withWordbookLock(async () => {
+    const latest = await loadWordbookEntries();
+    const zhById = new Map(
+      need.map((item, index) => [item.id, AryaWordbook.pickZh(translations[index], item.en)])
+    );
+    const next = latest.map((item) => {
+      const zh = zhById.get(item.id);
+      if (!zh) return item;
+      return { ...item, zh, updatedAt: Date.now() };
+    });
+    await saveWordbookEntries(next);
+    scheduleOssPush();
+    return { success: true, entries: next, filled: [...zhById.values()].filter(Boolean).length };
+  });
+}
+
+async function deleteWordbookEntry(id) {
+  return withWordbookLock(async () => {
+    const current = await loadWordbookEntries();
+    const next = current.filter((item) => item.id !== id);
+    await saveWordbookEntries(next);
+    scheduleOssPush();
+    return { success: true, removed: current.length - next.length };
+  });
+}
+
+async function syncWordbookFromOss() {
+  return withWordbookLock(async () => {
+    const local = await loadWordbookEntries();
+    const pulled = await pullWordbookFromOss();
+    if (pulled.skipped) {
+      lastOssError = '';
+      return { success: true, skipped: true, entries: local, configured: false };
+    }
+    const merged = AryaWordbook.mergeWordbookEntries(local, pulled.entries);
+    await saveWordbookEntries(merged);
+    await pushWordbookToOss(merged);
+    lastOssPullAt = Date.now();
+    lastOssError = '';
+    return { success: true, skipped: false, entries: merged, configured: true };
+  });
+}
+
+async function maybePullOssOnBoot() {
+  try {
+    const config = await getConfig();
+    if (!getOssConfig(config)) return;
+    if (Date.now() - lastOssPullAt < OSS_BOOT_PULL_MIN_MS) return;
+    lastOssPullAt = Date.now();
+    await syncWordbookFromOss();
+  } catch (error) {
+    lastOssError = error.message || 'OSS 同步失败';
+  }
+}
+
 function formatGlossaryPromptBlock(glossary) {
   if (!glossary?.length) return '';
   const lines = glossary.map((g) => `- ${g.from} → ${g.to}`).join('\n');
@@ -233,7 +590,10 @@ function protectGlossaryTerms(text, glossary) {
   const sorted = [...glossary].sort((a, b) => b.from.length - a.from.length);
   for (const g of sorted) {
     if (!g.from) continue;
-    const re = new RegExp(escapeRegExp(g.from), 'g');
+    const re = new RegExp(
+      `(?<![A-Za-z-])${escapeRegExp(g.from)}(?![A-Za-z-])`,
+      'gi'
+    );
     protectedText = protectedText.replace(re, () => {
       const idx = tokens.length;
       tokens.push(g.to);
@@ -753,8 +1113,7 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   if (!texts.length) return [];
 
   const modelId = (config.model || '').trim();
-  const glossary = normalizeGlossary(config.glossary);
-  const exactMap = new Map(glossary.map((g) => [g.from, g.to]));
+  const glossary = mergeBuiltinGlossary(config.glossary, config.targetLang);
   const results = new Array(texts.length);
   const needIndices = [];
   const needTexts = [];
@@ -762,8 +1121,7 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
 
   for (let i = 0; i < texts.length; i++) {
     const source = texts[i];
-    const normalized = normalizeCacheText(source);
-    const exact = exactMap.get(normalized);
+    const exact = lookupGlossaryExact(glossary, source);
     if (exact != null) {
       results[i] = exact;
       if (streamCallback) streamCallback([{ index: i, text: exact, cached: true }]);
@@ -772,19 +1130,21 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
     }
 
     const cached = await getCachedTranslation(source, config.targetLang, modelId);
-    if (cached != null) {
+    if (cached != null && isImplausibleTranslation(source, cached, config.targetLang)) {
+      await forgetCachedTranslation(source, config.targetLang, modelId);
+    } else if (cached != null) {
       results[i] = cached;
       if (streamCallback) streamCallback([{ index: i, text: cached, cached: true }]);
+      continue;
+    }
+    needIndices.push(i);
+    if (isMtModel(modelId) && glossary.length) {
+      const protectedItem = protectGlossaryTerms(source, glossary);
+      needTexts.push(protectedItem.text);
+      needTokenSets.push(protectedItem.tokens);
     } else {
-      needIndices.push(i);
-      if (isMtModel(modelId) && glossary.length) {
-        const protectedItem = protectGlossaryTerms(source, glossary);
-        needTexts.push(protectedItem.text);
-        needTokenSets.push(protectedItem.tokens);
-      } else {
-        needTexts.push(source);
-        needTokenSets.push([]);
-      }
+      needTexts.push(source);
+      needTokenSets.push([]);
     }
   }
 
@@ -852,9 +1212,13 @@ async function translateTextsReliable(texts, config, requestId, streamCallback =
   }
 
   for (let j = 0; j < needTexts.length; j++) {
-    const restored = restoreGlossaryTokens(apiResults[j], needTokenSets[j] || []);
+    const source = texts[needIndices[j]];
+    let restored = restoreGlossaryTokens(apiResults[j], needTokenSets[j] || []);
+    if (isImplausibleTranslation(source, restored, config.targetLang)) {
+      restored = lookupGlossaryExact(glossary, source) || source;
+    }
     results[needIndices[j]] = restored;
-    await setCachedTranslation(texts[needIndices[j]], config.targetLang, modelId, restored);
+    await setCachedTranslation(source, config.targetLang, modelId, restored);
   }
   return results;
 }
@@ -883,7 +1247,7 @@ async function ensureContentScripts(tabId) {
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      files: ['content/content.js']
+      files: ['shared/wordbook.js', 'content/content.js']
     });
   }
 }
@@ -1110,10 +1474,12 @@ async function queryPageTranslated(tabId) {
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureContextMenus();
+  maybePullOssOnBoot();
 });
 
 chrome.runtime.onStartup?.addListener?.(() => {
   ensureContextMenus();
+  maybePullOssOnBoot();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
@@ -1155,6 +1521,52 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     clearTranslationCache()
       .then((removed) => sendResponse({ success: true, removed }))
       .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'wordbookAdd') {
+    addWordbookEntry({
+      en: message.en,
+      zh: message.zh,
+      sourceUrl: message.sourceUrl
+    })
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'wordbookList') {
+    loadWordbookEntries()
+      .then((entries) => sendResponse({
+        success: true,
+        entries,
+        ossError: lastOssError || ''
+      }))
+      .catch((error) => sendResponse({ success: false, error: error.message, entries: [] }));
+    return true;
+  }
+
+  if (message.action === 'wordbookFillMissing') {
+    fillMissingWordbookZh()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'wordbookDelete') {
+    deleteWordbookEntry(message.id)
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (message.action === 'wordbookSync') {
+    syncWordbookFromOss()
+      .then((result) => sendResponse(result))
+      .catch((error) => {
+        lastOssError = error.message || 'OSS 同步失败';
+        sendResponse({ success: false, error: lastOssError, ossError: lastOssError });
+      });
     return true;
   }
 
@@ -1315,3 +1727,5 @@ chrome.runtime.onConnect.addListener((port) => {
       });
   });
 });
+
+maybePullOssOnBoot();

@@ -246,3 +246,9 @@ footer a {
 }
 
 footer a:hover { text-decoration: underline; }
+
+.footer-sep {
+  margin: 0 8px;
+  color: #cbd5e1;
+  font-size: 12px;
+}

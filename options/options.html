@@ -176,7 +176,7 @@
         <p class="desc" style="margin-bottom:0;font-size:13px">AI 网页翻译 · 由 Qwen-MT 驱动</p>
       </div>
     </div>
-    <p class="desc">不同厂商使用各自的 API Key。Qwen-MT 走百炼；DeepSeek、小米 MiMo 走各自官方平台。</p>
+    <p class="desc">不同厂商使用各自的 API Key。Qwen-MT 走百炼；DeepSeek、小米 MiMo 走各自官方平台。单词本请从弹窗进入独立页面。</p>
 
     <div class="info">
       Qwen-MT 开箱即用，无需填写 Key。如需使用通义千问 / DeepSeek / MiMo 等模型，请在下方填写对应 API Key。
@@ -303,7 +303,7 @@
         <div>
           <label for="selectionMinLength">最短选区长度</label>
           <input type="number" id="selectionMinLength" min="1" max="50" step="1" value="4">
-          <p class="hint">短于该长度不显示粉点。</p>
+          <p class="hint">短于该长度不显示粉点；单个英文单词不受此限制。</p>
         </div>
       </div>
       <div class="field">
@@ -325,7 +325,7 @@
 
     <div class="card">
       <h2>术语 / 专名表</h2>
-      <p class="hint" style="margin-bottom:12px">固定产品名、人名、UI 文案译法。整段精确匹配直接返回；长句中会约束模型或保护专名。最多 80 条。</p>
+      <p class="hint" style="margin-bottom:12px">固定产品名、人名、UI 文案译法。整段精确匹配直接返回；长句中会约束模型或保护专名。最多 80 条。译成中文时已内置部分词典义（如 Antigravity → 反重力），你添加的术语优先。</p>
       <div class="glossary-row table-head" style="margin-bottom:6px">
         <label style="margin:0">原文</label>
         <label style="margin:0">译文</label>
@@ -397,7 +397,7 @@
         Arya 以我女朋友的名字命名。❤️<br>
         希望它帮你更好地阅读这个世界。
       </p>
-      <p class="arya-version-note">v2.4.3 — 修复文档站翻译整页清空；反馈栏布局；悬停原文框空白处隐藏。</p>
+      <p class="arya-version-note">v2.4.4 — 划词自动收录单词本；可选同步到自有阿里云 OSS。</p>
     </div>
   </div>
   <script src="../shared/models.js"></script>

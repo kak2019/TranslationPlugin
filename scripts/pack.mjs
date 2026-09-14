@@ -14,6 +14,7 @@ const PACK_FILES = [
   'content',
   'popup',
   'options',
+  'wordbook',
   'shared',
   'icons'
 ];

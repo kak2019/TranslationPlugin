@@ -6,6 +6,7 @@ const cancelBtn = document.getElementById('cancelBtn');
 const restoreBtn = document.getElementById('restoreBtn');
 const statusEl = document.getElementById('status');
 const settingsLink = document.getElementById('settingsLink');
+const wordbookLink = document.getElementById('wordbookLink');
 const modelSubtitle = document.getElementById('modelSubtitle');
 const paymentBanner = document.getElementById('paymentBanner');
 const paymentBannerText = document.getElementById('paymentBannerText');
@@ -97,7 +98,7 @@ async function sendToContentScript(tabId, action, extra = {}) {
   } catch {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      files: ['content/content.js']
+      files: ['shared/wordbook.js', 'content/content.js']
     });
     return chrome.tabs.sendMessage(tabId, { action, ...extra }, { frameId: 0 });
   }
@@ -139,6 +140,11 @@ async function init() {
   autoTranslateToggle.checked = Boolean(stored.autoTranslate);
   if (bilingualToggle) bilingualToggle.checked = Boolean(stored.bilingualMode);
   updateModelHint(stored.model);
+
+  chrome.runtime.sendMessage({ action: 'wordbookList' }, (response) => {
+    const count = Array.isArray(response?.entries) ? response.entries.length : 0;
+    if (count) wordbookLink.textContent = `单词本（${count}）`;
+  });
 
   chrome.runtime.sendMessage({ action: 'getConfig' }, (response) => {
     const config = response?.config;
@@ -262,6 +268,11 @@ restoreBtn.addEventListener('click', async () => {
 settingsLink.addEventListener('click', (e) => {
   e.preventDefault();
   chrome.runtime.openOptionsPage();
+});
+
+wordbookLink.addEventListener('click', (e) => {
+  e.preventDefault();
+  chrome.tabs.create({ url: chrome.runtime.getURL('wordbook/wordbook.html') });
 });
 
 upgradeBtn.addEventListener('click', () => {

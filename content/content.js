@@ -436,7 +436,10 @@
     }
     const text = sel.toString().trim();
     const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
-    if (!text || text.length < minLen) {
+    const longEnough = typeof AryaWordbook?.meetsSelectionThreshold === 'function'
+      ? AryaWordbook.meetsSelectionThreshold(text, minLen)
+      : text.length >= minLen;
+    if (!text || !longEnough) {
       hideSelectionBubble();
       return;
     }
@@ -742,7 +745,10 @@
     if (!sel?.rangeCount || sel.isCollapsed) return null;
     const text = sel.toString().trim();
     const minLen = Math.max(1, Number(uiFeatureFlags.selectionMinLength) || 4);
-    if (!text || text.length < minLen || isLikelyNonTranslatable(text)) return null;
+    const longEnough = typeof AryaWordbook?.meetsSelectionThreshold === 'function'
+      ? AryaWordbook.meetsSelectionThreshold(text, minLen)
+      : text.length >= minLen;
+    if (!text || !longEnough || isLikelyNonTranslatable(text)) return null;
     try {
       const range = sel.getRangeAt(0);
       if (!selectionBelongsToThisFrame(range)) return null;
@@ -842,9 +848,11 @@
     panel.innerHTML = `
       <div class="arya-sel-status">翻译中…</div>
       <div class="arya-sel-text"></div>
+      <div class="arya-sel-wordbook" hidden></div>
       <div class="arya-sel-actions">
         <button type="button" class="arya-sel-btn" data-action="speak-src" title="朗读原文">🔊 原文</button>
         <button type="button" class="arya-sel-btn" data-action="speak-dst" title="朗读译文">🔊 译文</button>
+        <button type="button" class="arya-sel-btn" data-action="wordbook-remove" title="从单词本移出" style="display:none">移出单词本</button>
         <button type="button" class="arya-sel-btn primary" data-action="apply" title="替换页面中的选中文本">译入页面</button>
       </div>
     `;
@@ -866,13 +874,71 @@
     }
   }
 
+  function sendWordbookMessage(payload) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(payload, (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({ success: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve(response || { success: false });
+        });
+      } catch (error) {
+        resolve({ success: false, error: error.message });
+      }
+    });
+  }
+
+  async function autoSaveWordbookEntry(sourceText, translation, targetLang, statusEl, removeBtn, wordbookHintEl) {
+    if (!AryaWordbook?.isVocabCandidate?.(sourceText)) return;
+    const result = await sendWordbookMessage({
+      action: 'wordbookAdd',
+      en: sourceText,
+      zh: AryaWordbook.pickZh(translation, sourceText),
+      sourceUrl: location.href
+    });
+    if (!result?.success || !result.entry) return;
+    if (statusEl) {
+      statusEl.textContent = result.updated ? '已更新单词本' : '已加入单词本';
+    }
+    if (wordbookHintEl) {
+      wordbookHintEl.hidden = false;
+      wordbookHintEl.textContent = result.entry.zh
+        ? `单词本：${result.entry.zh}`
+        : '单词本：已收录';
+    }
+    if (!removeBtn) return;
+    removeBtn.style.display = '';
+    removeBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      sendWordbookMessage({ action: 'wordbookDelete', id: result.entry.id }).then((resp) => {
+        if (!resp?.success) return;
+        removeBtn.style.display = 'none';
+        if (statusEl) statusEl.textContent = '已移出单词本';
+        if (wordbookHintEl) {
+          wordbookHintEl.hidden = true;
+          wordbookHintEl.textContent = '';
+        }
+      });
+    };
+  }
+
   async function showSelectionPreviewPanel(sourceText, anchorRect, allowApply) {
     const settings = await getSettings();
     const panel = ensureSelectionPanel();
     const statusEl = panel.querySelector('.arya-sel-status');
     const textEl = panel.querySelector('.arya-sel-text');
+    const wordbookHintEl = panel.querySelector('.arya-sel-wordbook');
     const applyBtn = panel.querySelector('[data-action="apply"]');
+    const removeBtn = panel.querySelector('[data-action="wordbook-remove"]');
     applyBtn.style.display = allowApply ? '' : 'none';
+    if (removeBtn) removeBtn.style.display = 'none';
+    if (wordbookHintEl) {
+      wordbookHintEl.hidden = true;
+      wordbookHintEl.textContent = '';
+    }
     positionSelectionPanel(panel, anchorRect);
     panel.style.display = 'block';
 
@@ -927,7 +993,10 @@
 
     bindActions(translation);
 
-    if (translation) return;
+    if (translation) {
+      await autoSaveWordbookEntry(sourceText, translation, settings.targetLang, statusEl, removeBtn, wordbookHintEl);
+      return;
+    }
 
     try {
       const [result] = await translatePreviewTexts([sourceText], settings.targetLang);
@@ -942,6 +1011,7 @@
       statusEl.textContent = '译文';
       textEl.textContent = translation;
       bindActions(translation);
+      await autoSaveWordbookEntry(sourceText, translation, settings.targetLang, statusEl, removeBtn, wordbookHintEl);
     } catch (error) {
       if (token !== selectionPreviewToken || !selectionPanelEl) return;
       statusEl.textContent = '翻译失败';
@@ -1626,7 +1696,7 @@
   }
 
   function ensureOverlayStyles() {
-    const STYLE_VERSION = '19';
+    const STYLE_VERSION = '20';
     let style = document.getElementById('bailian-translate-styles');
     if (style?.dataset?.version === STYLE_VERSION) return;
     if (!style) {
@@ -1699,6 +1769,10 @@
       #arya-selection-panel .arya-sel-text {
         font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
         max-height: 180px; overflow: auto; margin-bottom: 10px; min-height: 1.2em; color: #334155;
+      }
+      #arya-selection-panel .arya-sel-wordbook {
+        font-size: 12px; line-height: 1.5; color: #be123c; font-weight: 600;
+        margin: -4px 0 10px; word-break: break-word;
       }
       #arya-selection-panel .arya-sel-actions { display: flex; flex-wrap: wrap; gap: 6px; }
       #arya-selection-panel .arya-sel-btn {
