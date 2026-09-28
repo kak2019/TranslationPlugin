@@ -1632,9 +1632,7 @@
       textToSegments.get(seg.text).push(seg);
     }
 
-    const batches = settings.isMt
-      ? chunkUniqueTexts(uniqueTexts)
-      : chunkUniqueByCount(uniqueTexts, settings.batchSize);
+    const batches = chunkUniquePlan(uniqueTexts, settings);
 
     let applied = 0;
 
@@ -2887,10 +2885,88 @@
 
   function compareDocumentOrder(a, b) {
     if (a === b) return 0;
-    const pos = a.compareDocumentPosition(b);
-    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    try {
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    } catch {
+      return 0;
+    }
     return 0;
+  }
+
+  function getUnitAnchorNode(unit) {
+    if (!unit) return null;
+    if (unit.host) return unit.host;
+    if (unit.block) return unit.block;
+    if (unit.node) return unit.node;
+    if (unit.element) return unit.element;
+    return unit.nodes?.[0] || null;
+  }
+
+  function getNodeViewportRect(node) {
+    const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!el?.getBoundingClientRect) return null;
+    try {
+      const rect = el.getBoundingClientRect();
+      let top = rect.top;
+      let left = rect.left;
+      const width = rect.width;
+      const height = rect.height;
+      let doc = el.ownerDocument;
+      while (doc && doc !== document) {
+        const frame = doc.defaultView?.frameElement;
+        if (!frame) break;
+        const frameRect = frame.getBoundingClientRect();
+        top += frameRect.top;
+        left += frameRect.left;
+        doc = frame.ownerDocument;
+      }
+      return { top, left, bottom: top + height, right: left + width, width, height };
+    } catch {
+      return null;
+    }
+  }
+
+  function isVisibleRect(rect) {
+    return Boolean(rect && (rect.width > 0 || rect.height > 0));
+  }
+
+  function sortUnitsByReadingOrder(units) {
+    const decorated = units.map((unit, index) => {
+      const rect = getNodeViewportRect(getUnitAnchorNode(unit));
+      const visible = isVisibleRect(rect);
+      return {
+        unit,
+        index,
+        rank: visible ? 0 : 1,
+        top: visible ? rect.top + (window.scrollY || 0) : Number.POSITIVE_INFINITY,
+        left: visible ? rect.left + (window.scrollX || 0) : 0
+      };
+    });
+    decorated.sort((a, b) => a.rank - b.rank || a.top - b.top || a.left - b.left || a.index - b.index);
+    return decorated.map((d) => d.unit);
+  }
+
+  function partitionUniqueTextsByViewport(uniqueTexts, textToNodes) {
+    const inView = [];
+    const below = [];
+    const above = [];
+    const vh = window.innerHeight || 0;
+
+    for (const text of uniqueTexts) {
+      const units = textToNodes.get(text) || [];
+      const rect = getNodeViewportRect(getUnitAnchorNode(units[0]));
+      if (!isVisibleRect(rect)) {
+        below.push(text);
+        continue;
+      }
+      if (rect.bottom > 0 && rect.top < vh) inView.push(text);
+      else if (rect.top >= vh) below.push(text);
+      else above.push(text);
+    }
+
+    return { inView, rest: below.concat(above) };
   }
 
   function joinBlockTextInOrder(nodes) {
@@ -3041,7 +3117,7 @@
       });
     }
 
-    return units.concat(singles);
+    return sortUnitsByReadingOrder(units.concat(singles));
   }
 
   function expandNodesForBilingualBlocks(nodes) {
@@ -3116,7 +3192,7 @@
     return { uniqueTexts, textToItems, totalItems: attrItems.length };
   }
 
-  function chunkUniqueTexts(uniqueTexts, maxChars = MT_BATCH_MAX_CHARS, maxSegments = MT_BATCH_MAX_SEGMENTS) {
+  function chunkUniqueTexts(uniqueTexts, maxChars = MT_BATCH_MAX_CHARS, maxSegments = MT_BATCH_MAX_SEGMENTS, indexOffset = 0) {
     const batches = [];
     let texts = [];
     let globalIndices = [];
@@ -3135,7 +3211,7 @@
       }
 
       texts.push(text);
-      globalIndices.push(i);
+      globalIndices.push(indexOffset + i);
       charCount += text.length + (texts.length > 1 ? 1 : 0);
     }
 
@@ -3143,16 +3219,22 @@
     return batches;
   }
 
-  function chunkUniqueByCount(uniqueTexts, batchSize) {
+  function chunkUniqueByCount(uniqueTexts, batchSize, indexOffset = 0) {
     const batches = [];
     for (let i = 0; i < uniqueTexts.length; i += batchSize) {
       const texts = uniqueTexts.slice(i, i + batchSize);
       batches.push({
         texts,
-        globalIndices: texts.map((_, j) => i + j)
+        globalIndices: texts.map((_, j) => indexOffset + i + j)
       });
     }
     return batches;
+  }
+
+  function chunkUniquePlan(uniqueTexts, settings, indexOffset = 0) {
+    return settings.isMt
+      ? chunkUniqueTexts(uniqueTexts, MT_BATCH_MAX_CHARS, MT_BATCH_MAX_SEGMENTS, indexOffset)
+      : chunkUniqueByCount(uniqueTexts, settings.batchSize, indexOffset);
   }
 
   async function translateBatchWithRetry(texts, maxRetries = 3) {
@@ -4035,9 +4117,7 @@
     const { uniqueTexts, textToItems, totalItems } = buildUniqueAttrPlan(attrItems);
     if (!uniqueTexts.length) return { count: 0, failed: 0 };
 
-    const batches = settings.isMt
-      ? chunkUniqueTexts(uniqueTexts)
-      : chunkUniqueByCount(uniqueTexts, settings.batchSize);
+    const batches = chunkUniquePlan(uniqueTexts, settings);
 
     let completed = 0;
     const failedBatches = [];
@@ -4086,39 +4166,46 @@
   async function translateNodeList(textNodes, settings, { incremental = false } = {}) {
     if (!textNodes.length || cancelRequested) return { count: 0, failed: 0 };
 
-    const { uniqueTexts, textToNodes, totalNodes } = buildUniqueTextPlan(textNodes);
-    if (!uniqueTexts.length) return { count: 0, failed: 0 };
+    const plan = buildUniqueTextPlan(textNodes);
+    if (!plan.uniqueTexts.length) return { count: 0, failed: 0 };
 
+    const { inView, rest } = partitionUniqueTextsByViewport(plan.uniqueTexts, plan.textToNodes);
+    const uniqueTexts = inView.concat(rest);
+    const { textToNodes, totalNodes } = plan;
     const ctx = { textToNodes, uniqueTexts, totalNodes, isMt: settings.isMt };
-    const batches = settings.isMt
-      ? chunkUniqueTexts(uniqueTexts)
-      : chunkUniqueByCount(uniqueTexts, settings.batchSize);
+    const viewportBatches = chunkUniquePlan(inView, settings, 0);
+    const restBatches = chunkUniquePlan(rest, settings, inView.length);
 
     if (incremental) {
       showOverlay(`Arya 发现 ${totalNodes} 段新内容…`, 30);
     }
 
-    const { completed, failedBatches } = await runConcurrent(
-      batches,
-      settings.concurrency,
-      (done, totalBatches, batchIndex, failCount = 0) => {
-        if (cancelRequested) return;
-        if (incremental) {
-          showOverlay(
-            `正在翻译新内容… ${done}/${totalNodes}`,
-            Math.min(95, Math.round((done / totalNodes) * 100))
-          );
-        } else {
-          showOverlay(
-            failCount
-              ? `正在重试 ${failCount} 批… ${done}/${totalNodes}`
-              : getAryaPhrase(),
-            Math.round((done / totalNodes) * 100)
-          );
-        }
-      },
-      ctx
-    );
+    const onProgress = (done, totalBatches, batchIndex, failCount = 0) => {
+      if (cancelRequested) return;
+      if (incremental) {
+        showOverlay(
+          `正在翻译新内容… ${done}/${totalNodes}`,
+          Math.min(95, Math.round((done / totalNodes) * 100))
+        );
+      } else {
+        showOverlay(
+          failCount
+            ? `正在重试 ${failCount} 批… ${done}/${totalNodes}`
+            : getAryaPhrase(),
+          Math.round((done / totalNodes) * 100)
+        );
+      }
+    };
+
+    const acc = { completedNodes: 0, failedBatches: [], appliedUnique: new Set() };
+    if (viewportBatches.length) {
+      await runConcurrent(viewportBatches, 1, onProgress, ctx, acc);
+    }
+    if (restBatches.length && !cancelRequested) {
+      await runConcurrent(restBatches, settings.concurrency, onProgress, ctx, acc);
+    }
+    const completed = acc.completedNodes;
+    const failedBatches = acc.failedBatches;
 
     if (cancelRequested) return { count: completed, failed: 0, cancelled: true };
 
@@ -4272,11 +4359,12 @@
     });
   }
 
-  async function runConcurrent(batches, concurrency, onProgress, ctx) {
+  async function runConcurrent(batches, concurrency, onProgress, ctx, acc = null) {
     const { textToNodes, uniqueTexts, totalNodes, isMt } = ctx;
-    let completedNodes = 0;
-    const failedBatches = [];
-    const appliedUnique = new Set();
+    const state = acc || { completedNodes: 0, failedBatches: [], appliedUnique: new Set() };
+    let completedNodes = state.completedNodes;
+    const failedBatches = state.failedBatches;
+    const appliedUnique = state.appliedUnique;
 
     function markApplied(uniqueIdx, translated) {
       if (!isValidTranslation(translated)) return 0;
@@ -4297,6 +4385,7 @@
       }
       if (added) onProgress(completedNodes + added, batches.length, 0, failedBatches.length);
       completedNodes += added;
+      state.completedNodes = completedNodes;
     }
 
     function applyBatchResult(batch, translations) {
@@ -4305,6 +4394,7 @@
         added += markApplied(uniqueIdx, translations[i]);
       });
       completedNodes += added;
+      state.completedNodes = completedNodes;
       return added;
     }
 
@@ -4361,7 +4451,8 @@
       );
     }
 
-    return { completed: completedNodes, failedBatches };
+    state.completedNodes = completedNodes;
+    return state;
   }
 
   async function retryFailedBatches(failedBatches, onProgress, ctx) {
